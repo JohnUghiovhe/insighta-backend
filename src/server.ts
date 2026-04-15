@@ -40,7 +40,7 @@ type ProfileRow = {
 const app = express();
 const PORT = Number(process.env.PORT) || 3021;
 const REQUEST_TIMEOUT_MS = 5000;
-const DB_DIR = path.resolve(process.cwd(), "data");
+const DB_DIR = process.env.DB_DIR ? path.resolve(process.env.DB_DIR) : path.resolve(process.cwd(), "data");
 const DB_PATH = path.resolve(DB_DIR, "profiles.db");
 
 app.use(express.json());
@@ -49,6 +49,10 @@ app.use(express.json());
 app.use((_req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   next();
+});
+
+app.get("/health", (_req: Request, res: Response) => {
+  res.status(200).json({ status: "ok" });
 });
 
 const toError = (res: Response, code: number, message: string): void => {
