@@ -1,55 +1,30 @@
 # Profiles API (Data Persistence)
 
-A TypeScript + Express API that:
+TypeScript + Express + SQLite API for demographic profiles with:
+- advanced filtering, sorting, and pagination
+- rule-based natural language search
+- UUID v7 profile IDs
+- UTC ISO 8601 timestamps
+- CORS enabled (`Access-Control-Allow-Origin: *`)
 
-- accepts a name,
-- calls three upstream APIs (`Genderize`, `Agify`, `Nationalize`),
-- classifies age group and top nationality,
-- stores the result in SQLite,
-- exposes CRUD-style endpoints for profile management.
+## Database Schema
 
-## External APIs Used
+The `profiles` table uses this structure:
+- `id` (UUID v7, primary key)
+- `name` (VARCHAR, unique)
+- `gender` (`male` | `female`)
+- `gender_probability` (float)
+- `age` (int)
+- `age_group` (`child` | `teenager` | `adult` | `senior`)
+- `country_id` (ISO alpha-2)
+- `country_name` (full name)
+- `country_probability` (float)
+- `created_at` (UTC ISO 8601 timestamp)
 
-- Genderize: `https://api.genderize.io?name={name}`
-- Agify: `https://api.agify.io?name={name}`
-- Nationalize: `https://api.nationalize.io?name={name}`
+## Seeding
 
-No API keys are required.
-
-## Core Behavior
-
-- **Create profile** from a name using all three upstream APIs.
-- **Deduplicate by name** (case-insensitive): if a profile already exists for that name, the existing record is returned and no new record is created.
-- **Persist data** in SQLite database at `data/profiles.db`.
-- **Use UUID v7** for all profile IDs.
-- **Store timestamps** as UTC ISO 8601 strings (`created_at`).
-- **Enable CORS** with `Access-Control-Allow-Origin: *`.
-
-## Classification Rules
-
-- **Age group** from Agify age:
-  - `0-12` -> `child`
-  - `13-19` -> `teenager`
-  - `20-59` -> `adult`
-  - `60+` -> `senior`
-- **Nationality** from Nationalize:
-  - choose the `country` item with the highest `probability`
-  - save both `country_id` and `country_probability`
-
-## Data Model
-
-Each stored profile contains:
-
-- `id` (UUID v7)
-- `name` (lowercased, unique case-insensitive)
-- `gender`
-- `gender_probability`
-- `sample_size` (Genderize `count`)
-- `age`
-- `age_group`
-- `country_id`
-- `country_probability`
-- `created_at` (UTC ISO 8601)
+On startup, the server reads `seed_profiles.json` and inserts all 2026 records using `INSERT OR IGNORE` on unique `name`.  
+This makes seeding idempotent: rerunning the seed does not create duplicates.
 
 ## API Base URL
 
@@ -63,210 +38,136 @@ All errors use:
 { "status": "error", "message": "<error message>" }
 ```
 
+Status codes used:
+- `400`: missing or empty parameter
+- `422`: invalid parameter type or invalid query parameters
+- `404`: profile not found
+- `500` / `502`: server or upstream failure
+
 ## Endpoints
 
-### 1) Create Profile
+### `GET /api/profiles`
 
-`POST /api/profiles`
+Supports combined filtering, sorting, and pagination.
 
-Request body:
-
-```json
-{ "name": "ella" }
-```
-
-Success (`201 Created`) when new profile is created:
-
-```json
-{
-  "status": "success",
-  "data": {
-    "id": "019d91a4-7c3c-7fc9-b5d2-a82cc21b5811",
-    "name": "ella",
-    "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 97517,
-    "age": 53,
-    "age_group": "adult",
-    "country_id": "CM",
-    "country_probability": 0.09677289106552395,
-    "created_at": "2026-04-15T14:56:09.278Z"
-  }
-}
-```
-
-Success (`200 OK`) when profile already exists for the same name:
-
-```json
-{
-  "status": "success",
-  "message": "Profile already exists",
-  "data": {
-    "id": "019d91a4-7c3c-7fc9-b5d2-a82cc21b5811",
-    "name": "ella",
-    "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 97517,
-    "age": 53,
-    "age_group": "adult",
-    "country_id": "CM",
-    "country_probability": 0.09677289106552395,
-    "created_at": "2026-04-15T14:56:09.278Z"
-  }
-}
-```
-
-### 2) Get Single Profile
-
-`GET /api/profiles/{id}`
-
-Success (`200 OK`):
-
-```json
-{
-  "status": "success",
-  "data": {
-    "id": "019d91a4-7c3c-7fc9-b5d2-a82cc21b5811",
-    "name": "ella",
-    "gender": "female",
-    "gender_probability": 0.99,
-    "sample_size": 97517,
-    "age": 53,
-    "age_group": "adult",
-    "country_id": "CM",
-    "country_probability": 0.09677289106552395,
-    "created_at": "2026-04-15T14:56:09.278Z"
-  }
-}
-```
-
-### 3) Get All Profiles
-
-`GET /api/profiles`
-
-Optional query parameters (all case-insensitive):
-
+Filters:
 - `gender`
-- `country_id`
 - `age_group`
+- `country_id`
+- `min_age`
+- `max_age`
+- `min_gender_probability`
+- `min_country_probability`
+
+Sort:
+- `sort_by`: `age` | `created_at` | `gender_probability`
+- `order`: `asc` | `desc`
+
+Pagination:
+- `page` default `1`
+- `limit` default `10`, max `50`
 
 Example:
 
-`GET /api/profiles?gender=male&country_id=NG`
+`/api/profiles?gender=male&country_id=NG&min_age=25&sort_by=age&order=desc&page=1&limit=10`
 
-Success (`200 OK`):
+Success response:
 
 ```json
 {
   "status": "success",
-  "count": 2,
+  "page": 1,
+  "limit": 10,
+  "total": 2026,
   "data": [
     {
-      "id": "id-1",
+      "id": "019d91a4-7c3c-7fc9-b5d2-a82cc21b5811",
       "name": "emmanuel",
       "gender": "male",
-      "age": 25,
+      "gender_probability": 0.99,
+      "age": 34,
       "age_group": "adult",
-      "country_id": "NG"
-    },
-    {
-      "id": "id-2",
-      "name": "sarah",
-      "gender": "female",
-      "age": 28,
-      "age_group": "adult",
-      "country_id": "US"
+      "country_id": "NG",
+      "country_name": "Nigeria",
+      "country_probability": 0.85,
+      "created_at": "2026-04-01T12:00:00.000Z"
     }
   ]
 }
 ```
 
-### 4) Delete Profile
+Invalid filter/sort/pagination inputs return:
 
-`DELETE /api/profiles/{id}`
+```json
+{ "status": "error", "message": "Invalid query parameters" }
+```
 
-Success: `204 No Content`
+### `GET /api/profiles/search`
 
-## Validation and Error Cases
+Natural language search endpoint.
 
-- `400 Bad Request`: missing or empty `name`
-  - message: `"Missing or empty name"`
-- `422 Unprocessable Entity`: invalid `name` type
-  - message: `"Invalid type"`
-- `404 Not Found`: profile not found
-  - message: `"Profile not found"`
-- `500 Internal Server Error`: unexpected server failures
-  - message: `"Server failure"`
+Request:
+- `q` (required plain English query)
+- `page` and `limit` (same pagination rules as `/api/profiles`)
 
-### Upstream Invalid Data (Do Not Store)
+Example:
+- `/api/profiles/search?q=young males from nigeria`
 
-If upstream APIs return structurally invalid classification data, API responds with `502` and does not insert any row.
+If query cannot be interpreted:
 
-- Genderize `gender: null` or `count: 0`
-  - `{ "status": "error", "message": "Genderize returned an invalid response" }`
-- Agify `age: null`
-  - `{ "status": "error", "message": "Agify returned an invalid response" }`
-- Nationalize empty `country`
-  - `{ "status": "error", "message": "Nationalize returned an invalid response" }`
+```json
+{ "status": "error", "message": "Unable to interpret query" }
+```
+
+## Natural Language Parsing Approach
+
+The parser is rule-based (no AI/LLM) and works in these steps:
+
+1. Normalize query to lowercase and collapse extra spaces.
+2. Detect gender keywords:
+   - `male`, `males`, `man`, `men` -> `gender=male`
+   - `female`, `females`, `woman`, `women` -> `gender=female`
+   - if both appear, gender filter is not set.
+3. Detect age-group keywords:
+   - `child` / `children` -> `age_group=child`
+   - `teen`, `teenage`, `teenager`, `teenagers` -> `age_group=teenager`
+   - `adult` / `adults` -> `age_group=adult`
+   - `senior`, `seniors`, `elderly` -> `age_group=senior`
+4. Detect numeric age constraints:
+   - `above|over|older than|greater than <n>` -> `min_age=<n>`
+   - `below|under|younger than|less than <n>` -> `max_age=<n>`
+5. Special keyword:
+   - `young` -> `min_age=16` and `max_age=24` (parsing-only rule, not a stored age group)
+6. Detect country phrase:
+   - `from <country name>` -> resolve `country_id` by matching `country_name` in DB.
+7. If no valid rule produces filters, return `"Unable to interpret query"`.
+
+### Supported Query Mappings
+
+- `young males` -> `gender=male + min_age=16 + max_age=24`
+- `females above 30` -> `gender=female + min_age=30`
+- `people from angola` -> `country_id=AO`
+- `adult males from kenya` -> `gender=male + age_group=adult + country_id=KE`
+- `male and female teenagers above 17` -> `age_group=teenager + min_age=17`
+
+## Parser Limitations
+
+- It does not support complex grammar like negation (`not from nigeria`) or OR groups (`male or female from ghana or kenya`).
+- It only recognizes explicit keyword patterns listed above.
+- It does not infer misspellings (`nigerai`) or fuzzy country matches.
+- It does not resolve multiple country phrases in one query.
+- `young` is always fixed to `16-24`, regardless of context.
 
 ## Quick Start
 
-### 1) Install dependencies
-
 ```bash
 npm install
-```
-
-### 2) Run in development
-
-```bash
 npm run dev
 ```
 
-Default port is `3021`.  
-Override with `PORT` when needed:
-
-```bash
-# PowerShell
-$env:PORT=3000; npm run dev
-```
-
-### 3) Build and run production
+Production:
 
 ```bash
 npm run build
 npm start
 ```
-
-## cURL Examples
-
-Create:
-
-```bash
-curl -X POST "http://localhost:3021/api/profiles" \
-  -H "Content-Type: application/json" \
-  -d "{\"name\":\"ella\"}"
-```
-
-List with filters:
-
-```bash
-curl "http://localhost:3021/api/profiles?gender=female&age_group=adult"
-```
-
-Get by ID:
-
-```bash
-curl "http://localhost:3021/api/profiles/<profile-id>"
-```
-
-Delete:
-
-```bash
-curl -X DELETE "http://localhost:3021/api/profiles/<profile-id>"
-```
-
-## Project Structure
-
-- `src/server.ts`: API routes, upstream integration, validation, UUID v7 generation, SQLite bootstrap.
-- `data/profiles.db`: runtime SQLite database file (auto-created, ignored by git).
