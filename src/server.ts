@@ -49,6 +49,11 @@ type ParsedFilters = {
   min_country_probability?: number;
 };
 
+type CursorPayload = {
+  created_at: string;
+  id: string;
+};
+
 const app = express();
 const PORT = Number(process.env.PORT) || 3021;
 const REQUEST_TIMEOUT_MS = 5000;
@@ -277,20 +282,31 @@ const parseFilterQuery = (query: Request["query"]): ParsedFilters | null => {
 
 const parsePagingAndSort = (
   query: Request["query"]
-): { page: number; limit: number; sortBy: "age" | "created_at" | "gender_probability"; order: "asc" | "desc" } | null => {
+): {
+  page?: number;
+  limit: number;
+  sortBy: "age" | "created_at" | "gender_probability";
+  order: "asc" | "desc";
+  cursor?: CursorPayload;
+} | null => {
   const pageRaw = query.page;
   const limitRaw = query.limit;
   const sortByRaw = query.sort_by;
   const orderRaw = query.order;
+  const cursorRaw = query.cursor;
 
-  if (Array.isArray(pageRaw) || Array.isArray(limitRaw) || Array.isArray(sortByRaw) || Array.isArray(orderRaw)) {
+  if (
+    Array.isArray(pageRaw) ||
+    Array.isArray(limitRaw) ||
+    Array.isArray(sortByRaw) ||
+    Array.isArray(orderRaw) ||
+    Array.isArray(cursorRaw)
+  ) {
     return null;
   }
 
-  const page = pageRaw === undefined ? 1 : Number(pageRaw);
   const limit = limitRaw === undefined ? 10 : Number(limitRaw);
-
-  if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 50) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
     return null;
   }
 
@@ -302,7 +318,67 @@ const parsePagingAndSort = (
 
   if (!ALLOWED_SORT_COLUMNS.has(sortBy) || !ALLOWED_ORDER.has(order)) return null;
 
+  let cursor: CursorPayload | undefined;
+  if (cursorRaw !== undefined) {
+    if (typeof cursorRaw !== "string" || !cursorRaw.trim()) return null;
+    if (sortBy !== "created_at") return null;
+    if (pageRaw !== undefined) return null;
+
+    try {
+      const decoded = Buffer.from(cursorRaw, "base64url").toString("utf8");
+      const parsed = JSON.parse(decoded) as CursorPayload;
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof parsed.created_at !== "string" ||
+        !parsed.created_at ||
+        typeof parsed.id !== "string" ||
+        !parsed.id
+      ) {
+        return null;
+      }
+      cursor = parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  if (cursor) {
+    return { limit, sortBy, order, cursor };
+  }
+
+  const page = pageRaw === undefined ? 1 : Number(pageRaw);
+  if (!Number.isInteger(page) || page < 1) return null;
+
   return { page, limit, sortBy, order };
+};
+
+const encodeCursor = (row: Pick<ProfileRow, "created_at" | "id">): string => {
+  return Buffer.from(
+    JSON.stringify({
+      created_at: row.created_at,
+      id: row.id
+    }),
+    "utf8"
+  ).toString("base64url");
+};
+
+const appendCursorCondition = (
+  whereClause: string,
+  order: "asc" | "desc",
+  cursor: CursorPayload,
+  values: Array<string | number>
+): string => {
+  values.push(cursor.created_at, cursor.created_at, cursor.id);
+  const comparator = order === "asc" ? ">" : "<";
+  const start = values.length - 2;
+  const cursorCondition = `(created_at ${comparator} ? OR (created_at = ? AND id ${comparator} ?))`;
+
+  if (!whereClause) {
+    return `WHERE ${cursorCondition}`;
+  }
+
+  return `${whereClause} AND ${cursorCondition}`;
 };
 
 const parseNaturalLanguageQuery = async (db: Database, rawQuery: string): Promise<ParsedFilters | null> => {
@@ -412,6 +488,7 @@ const initializeDatabase = async (): Promise<Database> => {
     CREATE INDEX IF NOT EXISTS idx_profiles_gender_probability ON profiles(gender_probability);
     CREATE INDEX IF NOT EXISTS idx_profiles_country_probability ON profiles(country_probability);
     CREATE INDEX IF NOT EXISTS idx_profiles_country_name ON profiles(country_name);
+    CREATE INDEX IF NOT EXISTS idx_profiles_country_name_lower ON profiles(LOWER(country_name));
   `);
 
   const seedRaw = fs.readFileSync(SEED_PATH, "utf8");
@@ -596,13 +673,36 @@ app.get("/api/profiles", async (req: Request, res: Response) => {
 
     const db = await getDb();
     const { clause, values } = buildWhereClause(parsedFilters);
-    const offset = (pageSort.page - 1) * pageSort.limit;
-    const orderSql = `ORDER BY ${pageSort.sortBy} ${pageSort.order.toUpperCase()}`;
+    const orderSql = `ORDER BY ${pageSort.sortBy} ${pageSort.order.toUpperCase()}, id ${pageSort.order.toUpperCase()}`;
 
     const totalRow = await db.get<{ total: number }>(
       `SELECT COUNT(*) as total FROM profiles ${clause}`,
       ...values
     );
+
+    if (pageSort.cursor) {
+      const cursorValues = [...values];
+      const cursorClause = appendCursorCondition(clause, pageSort.order, pageSort.cursor, cursorValues);
+      const rows = await db.all<ProfileRow[]>(
+        `SELECT * FROM profiles ${cursorClause} ${orderSql} LIMIT ?`,
+        ...cursorValues,
+        pageSort.limit + 1
+      );
+
+      const hasMore = rows.length > pageSort.limit;
+      const data = hasMore ? rows.slice(0, pageSort.limit) : rows;
+      const nextCursor = hasMore && data.length > 0 ? encodeCursor(data[data.length - 1]) : null;
+
+      return res.status(200).json({
+        status: "success",
+        limit: pageSort.limit,
+        total: Number(totalRow?.total ?? 0),
+        next_cursor: nextCursor,
+        data
+      });
+    }
+
+    const offset = ((pageSort.page ?? 1) - 1) * pageSort.limit;
     const rows = await db.all<ProfileRow[]>(
       `SELECT * FROM profiles ${clause} ${orderSql} LIMIT ? OFFSET ?`,
       ...values,

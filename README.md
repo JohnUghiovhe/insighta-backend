@@ -72,10 +72,21 @@ Sort:
 Pagination:
 - `page` default `1`
 - `limit` default `10`, max `50`
+- `cursor` (optional): keyset pagination token for large datasets
+
+Cursor pagination notes:
+- Use `cursor` with `limit` (and optional filters).
+- `cursor` mode is supported with `sort_by=created_at` only.
+- Do not send `page` and `cursor` together.
+- Response includes `next_cursor` when more rows are available.
 
 Example:
 
 `/api/profiles?gender=male&country_id=NG&min_age=25&sort_by=age&order=desc&page=1&limit=10`
+
+Cursor example:
+
+`/api/profiles?gender=male&sort_by=created_at&order=desc&limit=10&cursor=<token>`
 
 Success response:
 
