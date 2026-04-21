@@ -1,58 +1,163 @@
-# Profiles API (Data Persistence)
+# Intelligence-query-engine
 
-TypeScript + Express + SQLite API for demographic profiles with:
-- advanced filtering, sorting, and pagination
-- rule-based natural language search
-- UUID v7 profile IDs
-- UTC ISO 8601 timestamps
-- CORS enabled (`Access-Control-Allow-Origin: *`)
+Intelligence-query-engine is a TypeScript + Express API that stores and serves enriched demographic profiles using SQLite.
+
+It supports:
+- profile creation from upstream demographic APIs
+- advanced filtering with combined conditions
+- sorting and pagination (offset and cursor/keyset)
+- natural language query parsing
+- idempotent seeding of 2026 profiles
+- CORS (`Access-Control-Allow-Origin: *`)
+
+## Tech Stack
+
+- Runtime: Node.js
+- Language: TypeScript
+- Web framework: Express 5
+- Database: SQLite (`sqlite` + `sqlite3`)
+- Build/dev: `tsc`, `tsx`
+
+## Project Structure
+
+- `src/server.ts`: main API server and database initialization
+- `src/seed.ts`: manual seeding utility for `seed_profiles.json`
+- `seed_profiles.json`: source dataset (2026 records)
+- `data/profiles.db`: SQLite database file (created at runtime)
 
 ## Database Schema
 
-The `profiles` table uses this structure:
+Table: `profiles`
+
 - `id` (UUID v7, primary key)
-- `name` (VARCHAR, unique)
+- `name` (TEXT, unique, case-insensitive)
 - `gender` (`male` | `female`)
-- `gender_probability` (float)
-- `age` (int)
+- `gender_probability` (REAL)
+- `age` (INTEGER)
 - `age_group` (`child` | `teenager` | `adult` | `senior`)
 - `country_id` (ISO alpha-2)
-- `country_name` (full name)
-- `country_probability` (float)
-- `created_at` (UTC ISO 8601 timestamp)
+- `country_name` (TEXT)
+- `country_probability` (REAL)
+- `created_at` (UTC ISO 8601)
+
+Indexes currently created:
+- `idx_profiles_gender`
+- `idx_profiles_age_group`
+- `idx_profiles_country_id`
+- `idx_profiles_age`
+- `idx_profiles_created_at`
+- `idx_profiles_gender_probability`
+- `idx_profiles_country_probability`
+- `idx_profiles_country_name`
+- `idx_profiles_country_name_lower` (functional index on `LOWER(country_name)`)
 
 ## Seeding
 
-On startup, the server reads `seed_profiles.json` and inserts all 2026 records using `INSERT OR IGNORE` on unique `name`.  
-This makes seeding idempotent: rerunning the seed does not create duplicates.
+The app seeds on server startup from `seed_profiles.json` using `INSERT OR IGNORE`, so reruns are idempotent.
 
-To explicitly seed/reseed from the JSON file at any time:
+Manual seed command:
 
 ```bash
 npm run seed
 ```
 
-## API Base URL
+Seed script summary:
+- Reads all 2026 profiles from `seed_profiles.json`
+- Inserts with normalized values (lowercased names, uppercased country IDs)
+- Uses transaction (`BEGIN/COMMIT/ROLLBACK`)
+- Prints source and DB counts on completion
 
-`http://localhost:3021`
+## Run Instructions
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Development:
+
+```bash
+npm run dev
+```
+
+Build:
+
+```bash
+npm run build
+```
+
+Production:
+
+```bash
+npm start
+```
+
+## Base URL
+
+- Local: `http://localhost:3021`
 
 ## Error Format
 
-All errors use:
+All errors return:
 
 ```json
 { "status": "error", "message": "<error message>" }
 ```
 
-Status codes used:
-- `400`: missing or empty parameter
-- `422`: invalid parameter type or invalid query parameters
+Common status codes:
+- `400`: missing/empty required parameter or unparseable natural language query
 - `404`: profile not found
-- `500` / `502`: server or upstream failure
+- `422`: invalid query parameters or invalid parameter type
+- `500`: server failure
+- `502`: upstream service failure or invalid upstream response
 
-## Endpoints
+## API Endpoints
 
-### `GET /api/profiles`
+### Health
+
+`GET /health`
+
+Response:
+
+```json
+{ "status": "ok" }
+```
+
+### Create Profile
+
+`POST /api/profiles`
+
+Body:
+
+```json
+{ "name": "emmanuel" }
+```
+
+Behavior:
+- Validates `name`
+- Checks existing profile by case-insensitive name
+- If not found, fetches upstream data from:
+  - `genderize.io`
+  - `agify.io`
+  - `nationalize.io`
+- Inserts a new profile and returns it
+
+### Get One Profile
+
+`GET /api/profiles/:id`
+
+Returns one profile or `404`.
+
+### Delete Profile
+
+`DELETE /api/profiles/:id`
+
+Returns `204` when deleted, `404` if not found.
+
+### List Profiles
+
+`GET /api/profiles`
 
 Supports combined filtering, sorting, and pagination.
 
@@ -62,25 +167,24 @@ Filters:
 - `country_id`
 - `min_age`
 - `max_age`
-- `min_gender_probability`
-- `min_country_probability`
+- `min_gender_probability` (`0..1`)
+- `min_country_probability` (`0..1`)
 
-Sort:
+Sorting:
 - `sort_by`: `age` | `created_at` | `gender_probability`
 - `order`: `asc` | `desc`
 
-Pagination:
+Pagination mode A (offset/page):
 - `page` default `1`
 - `limit` default `10`, max `50`
-- `cursor` (optional): keyset pagination token for large datasets
 
-Cursor pagination notes:
-- Use `cursor` with `limit` (and optional filters).
-- `cursor` mode is supported with `sort_by=created_at` only.
-- Do not send `page` and `cursor` together.
-- Response includes `next_cursor` when more rows are available.
+Pagination mode B (cursor/keyset):
+- `cursor` token + `limit`
+- only valid when `sort_by=created_at`
+- cannot be combined with `page`
+- response includes `next_cursor` when more rows exist
 
-Example:
+Offset example:
 
 `/api/profiles?gender=male&country_id=NG&min_age=25&sort_by=age&order=desc&page=1&limit=10`
 
@@ -88,103 +192,56 @@ Cursor example:
 
 `/api/profiles?gender=male&sort_by=created_at&order=desc&limit=10&cursor=<token>`
 
-Success response:
+### Natural Language Search
 
-```json
-{
-  "status": "success",
-  "page": 1,
-  "limit": 10,
-  "total": 2026,
-  "data": [
-    {
-      "id": "019d91a4-7c3c-7fc9-b5d2-a82cc21b5811",
-      "name": "emmanuel",
-      "gender": "male",
-      "gender_probability": 0.99,
-      "age": 34,
-      "age_group": "adult",
-      "country_id": "NG",
-      "country_name": "Nigeria",
-      "country_probability": 0.85,
-      "created_at": "2026-04-01T12:00:00.000Z"
-    }
-  ]
-}
-```
-
-Invalid filter/sort/pagination inputs return:
-
-```json
-{ "status": "error", "message": "Invalid query parameters" }
-```
-
-### `GET /api/profiles/search`
-
-Natural language search endpoint.
-
-Request:
-- `q` (required plain English query)
-- `page` and `limit` (same pagination rules as `/api/profiles`)
+`GET /api/profiles/search?q=<query>&page=<n>&limit=<n>`
 
 Example:
-- `/api/profiles/search?q=young males from nigeria`
 
-If query cannot be interpreted:
+`/api/profiles/search?q=young males from nigeria&page=1&limit=10`
 
-```json
-{ "status": "error", "message": "Unable to interpret query" }
-```
+Returns `400` with `Unable to interpret query` when no rule can be applied.
 
-## Natural Language Parsing Approach
+## Natural Language Parsing Rules
 
-The parser is rule-based (no AI/LLM) and works in these steps:
+The parser is rule-based (non-LLM):
 
-1. Normalize query to lowercase and collapse extra spaces.
-2. Detect gender keywords:
-   - `male`, `males`, `man`, `men` -> `gender=male`
-   - `female`, `females`, `woman`, `women` -> `gender=female`
-   - if both appear, gender filter is not set.
-3. Detect age-group keywords:
-   - `child` / `children` -> `age_group=child`
-   - `teen`, `teenage`, `teenager`, `teenagers` -> `age_group=teenager`
-   - `adult` / `adults` -> `age_group=adult`
-   - `senior`, `seniors`, `elderly` -> `age_group=senior`
-4. Detect numeric age constraints:
-   - `above|over|older than|greater than <n>` -> `min_age=<n>`
-   - `below|under|younger than|less than <n>` -> `max_age=<n>`
+1. Normalize to lowercase and collapse whitespace.
+2. Gender detection:
+   - male words -> `gender=male`
+   - female words -> `gender=female`
+   - if both appear, gender filter is omitted
+3. Age-group detection:
+   - child/children -> `age_group=child`
+   - teen/teenage/teenager(s) -> `age_group=teenager`
+   - adult(s) -> `age_group=adult`
+   - senior(s)/elderly -> `age_group=senior`
+4. Numeric age constraints:
+   - above/over/older than/greater than `<n>` -> `min_age`
+   - below/under/younger than/less than `<n>` -> `max_age`
 5. Special keyword:
-   - `young` -> `min_age=16` and `max_age=24` (parsing-only rule, not a stored age group)
-6. Detect country phrase:
-   - `from <country name>` -> resolve `country_id` by matching `country_name` in DB.
-7. If no valid rule produces filters, return `"Unable to interpret query"`.
+   - young -> fixed `min_age=16`, `max_age=24`
+6. Country phrase:
+   - `from <country name>` mapped by case-insensitive `country_name` lookup
+7. If no valid rule produced filters, return `Unable to interpret query`.
 
-### Supported Query Mappings
+## Validation Rules (Highlights)
 
-- `young males` -> `gender=male + min_age=16 + max_age=24`
-- `females above 30` -> `gender=female + min_age=30`
-- `people from angola` -> `country_id=AO`
-- `adult males from kenya` -> `gender=male + age_group=adult + country_id=KE`
-- `male and female teenagers above 17` -> `age_group=teenager + min_age=17`
+- `name` is required and must be a non-empty string
+- `country_id` filter must be two uppercase letters
+- probabilities must be numeric and in range `0..1`
+- `min_age <= max_age`
+- `page >= 1`, `1 <= limit <= 50`
+- invalid arrays/multi-values for single-valued params are rejected
 
-## Parser Limitations
+## Current Feature Status
 
-- It does not support complex grammar like negation (`not from nigeria`) or OR groups (`male or female from ghana or kenya`).
-- It only recognizes explicit keyword patterns listed above.
-- It does not infer misspellings (`nigerai`) or fuzzy country matches.
-- It does not resolve multiple country phrases in one query.
-- `young` is always fixed to `16-24`, regardless of context.
-
-## Quick Start
-
-```bash
-npm install
-npm run dev
-```
-
-Production:
-
-```bash
-npm run build
-npm start
-```
+Implemented and production-safe:
+- SQLite persistence
+- startup seeding + manual seed script
+- combined filtering
+- sorting
+- offset and cursor pagination
+- natural language parsing
+- endpoint-level validation and structured errors
+- functional index support for case-insensitive country-name lookup

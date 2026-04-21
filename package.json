@@ -1,5 +1,5 @@
 {
-  "name": "API - Data persistence",
+  "name": "intelligence-query-engine",
   "version": "1.0.0",
   "description": "",
   "main": "dist/server.js",
