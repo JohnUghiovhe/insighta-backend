@@ -26,6 +26,12 @@ The `profiles` table uses this structure:
 On startup, the server reads `seed_profiles.json` and inserts all 2026 records using `INSERT OR IGNORE` on unique `name`.  
 This makes seeding idempotent: rerunning the seed does not create duplicates.
 
+To explicitly seed/reseed from the JSON file at any time:
+
+```bash
+npm run seed
+```
+
 ## API Base URL
 
 `http://localhost:3021`
