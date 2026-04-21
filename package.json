@@ -5,7 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/server.ts",
+    "dev": "tsx watch --exclude data/** --exclude dist/** src/server.ts",
     "seed": "tsx src/seed.ts",
     "start": "node dist/server.js"
   },

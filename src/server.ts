@@ -495,6 +495,12 @@ const initializeDatabase = async (): Promise<Database> => {
   const seedData = JSON.parse(seedRaw) as { profiles?: SeedProfile[] };
   const rows = Array.isArray(seedData.profiles) ? seedData.profiles : [];
 
+  const existingRowCount = await db.get<{ total: number }>("SELECT COUNT(*) as total FROM profiles");
+  const existingTotal = Number(existingRowCount?.total ?? 0);
+  if (existingTotal >= rows.length) {
+    return db;
+  }
+
   for (const profile of rows) {
     await db.run(
       `INSERT OR IGNORE INTO profiles (
