@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import { pool, withTransaction } from "../db";
-import { ACCESS_TOKEN_TTL_MS, PKCE_STATE_TTL_MS, REFRESH_TOKEN_TTL_MS, REQUEST_TIMEOUT_MS } from "../config";
+import { ACCESS_TOKEN_TTL_MS, REFRESH_TOKEN_TTL_MS, REQUEST_TIMEOUT_MS } from "../config";
 import { createOpaqueToken, createPkceChallenge, generateUuidV7, hashToken } from "../utils/crypto";
 import { toError } from "../utils/http";
 import { Role } from "../types";
@@ -46,6 +46,115 @@ const fetchJson = async <T>(url: string, headers?: Record<string, string>): Prom
   return (await response.json()) as T;
 };
 
+const exchangeGithubCode = async (
+  githubClientId: string,
+  githubClientSecret: string,
+  code: string,
+  redirectUri: string,
+  codeVerifier: string
+): Promise<string> => {
+  const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      client_id: githubClientId,
+      client_secret: githubClientSecret,
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: codeVerifier
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+  });
+
+  if (!tokenResponse.ok) {
+    throw new Error("GITHUB_TOKEN_EXCHANGE_FAILED");
+  }
+
+  const tokenPayload = (await tokenResponse.json()) as { access_token?: string };
+  if (!tokenPayload.access_token) {
+    throw new Error("GITHUB_TOKEN_EXCHANGE_FAILED");
+  }
+
+  return tokenPayload.access_token;
+};
+
+const upsertUserAndIssueTokens = async (
+  githubAccessToken: string
+): Promise<{
+  user: Record<string, unknown>;
+  tokenPair: Awaited<ReturnType<typeof issueTokenPair>>;
+}> =>
+  withTransaction(async (client) => {
+    const githubUser = await fetchJson<{
+      id: number;
+      login: string;
+      avatar_url: string;
+      email: string | null;
+    }>("https://api.github.com/user", {
+      Authorization: `Bearer ${githubAccessToken}`,
+      "User-Agent": "insighta-labs-plus"
+    });
+
+    let email = githubUser.email;
+    if (!email) {
+      try {
+        const emailResult = await fetchJson<Array<{ email: string; primary: boolean; verified: boolean }>>(
+          "https://api.github.com/user/emails",
+          {
+            Authorization: `Bearer ${githubAccessToken}`,
+            "User-Agent": "insighta-labs-plus"
+          }
+        );
+        const primaryVerified = emailResult.find((item) => item.primary && item.verified);
+        email = primaryVerified?.email ?? null;
+      } catch {
+        email = null;
+      }
+    }
+
+    const userResult = await client.query(
+      `INSERT INTO users (
+        id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at
+      ) VALUES ($1, $2, $3, $4, $5, 'analyst', TRUE, NOW(), NOW())
+      ON CONFLICT (github_id)
+      DO UPDATE SET
+        username = EXCLUDED.username,
+        email = EXCLUDED.email,
+        avatar_url = EXCLUDED.avatar_url,
+        last_login_at = NOW()
+      RETURNING id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at`,
+      [generateUuidV7(), String(githubUser.id), githubUser.login, email, githubUser.avatar_url]
+    );
+
+    const user = userResult.rows[0];
+    const tokenPair = await issueTokenPair(client, String(user.id));
+    return { user, tokenPair };
+  });
+
+const sendAuthSuccess = (res: Response, result: { user: Record<string, unknown>; tokenPair: Awaited<ReturnType<typeof issueTokenPair>> }) => {
+  res.status(200).json({
+    status: "success",
+    access_token: result.tokenPair.accessToken,
+    refresh_token: result.tokenPair.refreshToken,
+    access_token_expires_in_seconds: ACCESS_TOKEN_TTL_MS / 1000,
+    refresh_token_expires_in_seconds: REFRESH_TOKEN_TTL_MS / 1000,
+    data: {
+      id: String(result.user.id),
+      github_id: String(result.user.github_id),
+      username: String(result.user.username),
+      email: result.user.email ? String(result.user.email) : null,
+      avatar_url: result.user.avatar_url ? String(result.user.avatar_url) : null,
+      role: String(result.user.role) as Role,
+      is_active: Boolean(result.user.is_active),
+      last_login_at: toIso(result.user.last_login_at),
+      created_at: toIso(result.user.created_at)
+    }
+  });
+};
+
 export const githubLogin = async (_req: Request, res: Response): Promise<void> => {
   const githubClientId = process.env.GITHUB_CLIENT_ID;
   const githubRedirectUri = process.env.GITHUB_REDIRECT_URI;
@@ -74,6 +183,20 @@ export const githubLogin = async (_req: Request, res: Response): Promise<void> =
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
 
   res.redirect(authorizeUrl.toString());
+};
+
+export const githubLoginInit = async (_req: Request, res: Response): Promise<void> => {
+  const githubClientId = process.env.GITHUB_CLIENT_ID;
+  if (!githubClientId) {
+    toError(res, 500, "GitHub OAuth is not configured");
+    return;
+  }
+
+  res.status(200).json({
+    status: "success",
+    client_id: githubClientId,
+    scope: process.env.GITHUB_SCOPE || "read:user user:email"
+  });
 };
 
 export const githubCallback = async (req: Request, res: Response): Promise<void> => {
@@ -116,109 +239,55 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
 
       await client.query("DELETE FROM oauth_pkce_states WHERE state = $1", [state]);
 
-      const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
-        method: "POST",
-        headers: {
-          Accept: "application/json",
-          "Content-Type": "application/x-www-form-urlencoded"
-        },
-        body: new URLSearchParams({
-          client_id: githubClientId,
-          client_secret: githubClientSecret,
-          code,
-          redirect_uri: githubRedirectUri,
-          code_verifier: String(pkceState.code_verifier)
-        }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      });
-
-      if (!tokenResponse.ok) {
-        throw new Error("GITHUB_TOKEN_EXCHANGE_FAILED");
-      }
-
-      const tokenPayload = (await tokenResponse.json()) as { access_token?: string; error?: string };
-      if (!tokenPayload.access_token) {
-        throw new Error("GITHUB_TOKEN_EXCHANGE_FAILED");
-      }
-
-      const githubUser = (await fetchJson<{
-        id: number;
-        login: string;
-        avatar_url: string;
-        email: string | null;
-      }>("https://api.github.com/user", {
-        Authorization: `Bearer ${tokenPayload.access_token}`,
-        "User-Agent": "insighta-labs-plus"
-      })) as {
-        id: number;
-        login: string;
-        avatar_url: string;
-        email: string | null;
-      };
-
-      let email = githubUser.email;
-      if (!email) {
-        try {
-          const emailResult = await fetchJson<Array<{ email: string; primary: boolean; verified: boolean }>>(
-            "https://api.github.com/user/emails",
-            {
-              Authorization: `Bearer ${tokenPayload.access_token}`,
-              "User-Agent": "insighta-labs-plus"
-            }
-          );
-          const primaryVerified = emailResult.find((item) => item.primary && item.verified);
-          email = primaryVerified?.email ?? null;
-        } catch {
-          email = null;
-        }
-      }
-
-      const userResult = await client.query(
-        `INSERT INTO users (
-          id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at
-         ) VALUES ($1, $2, $3, $4, $5, 'analyst', TRUE, NOW(), NOW())
-         ON CONFLICT (github_id)
-         DO UPDATE SET
-           username = EXCLUDED.username,
-           email = EXCLUDED.email,
-           avatar_url = EXCLUDED.avatar_url,
-           last_login_at = NOW()
-         RETURNING id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at`,
-        [generateUuidV7(), String(githubUser.id), githubUser.login, email, githubUser.avatar_url]
+      const githubAccessToken = await exchangeGithubCode(
+        githubClientId,
+        githubClientSecret,
+        code,
+        githubRedirectUri,
+        String(pkceState.code_verifier)
       );
-
-      const user = userResult.rows[0];
-      const tokenPair = await issueTokenPair(client, String(user.id));
-
-      return {
-        user,
-        tokenPair
-      };
+      return upsertUserAndIssueTokens(githubAccessToken);
     });
 
-    res.status(200).json({
-      status: "success",
-      access_token: result.tokenPair.accessToken,
-      refresh_token: result.tokenPair.refreshToken,
-      access_token_expires_in_seconds: ACCESS_TOKEN_TTL_MS / 1000,
-      refresh_token_expires_in_seconds: REFRESH_TOKEN_TTL_MS / 1000,
-      data: {
-        id: String(result.user.id),
-        github_id: String(result.user.github_id),
-        username: String(result.user.username),
-        email: result.user.email ? String(result.user.email) : null,
-        avatar_url: result.user.avatar_url ? String(result.user.avatar_url) : null,
-        role: String(result.user.role) as Role,
-        is_active: Boolean(result.user.is_active),
-        last_login_at: toIso(result.user.last_login_at),
-        created_at: toIso(result.user.created_at)
-      }
-    });
+    sendAuthSuccess(res, result);
   } catch (error) {
     if (error instanceof Error && error.message === "INVALID_OAUTH_STATE") {
       toError(res, 400, "Invalid or expired OAuth state");
       return;
     }
+    if (error instanceof Error && error.message === "GITHUB_TOKEN_EXCHANGE_FAILED") {
+      toError(res, 502, "GitHub token exchange failed");
+      return;
+    }
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      toError(res, 502, "GitHub request timeout");
+      return;
+    }
+    toError(res, 500, "Server failure");
+  }
+};
+
+export const githubCliExchange = async (req: Request, res: Response): Promise<void> => {
+  const githubClientId = process.env.GITHUB_CLIENT_ID;
+  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
+  if (!githubClientId || !githubClientSecret) {
+    toError(res, 500, "GitHub OAuth is not configured");
+    return;
+  }
+
+  const code = typeof req.body?.code === "string" ? req.body.code.trim() : "";
+  const codeVerifier = typeof req.body?.code_verifier === "string" ? req.body.code_verifier.trim() : "";
+  const redirectUri = typeof req.body?.redirect_uri === "string" ? req.body.redirect_uri.trim() : "";
+  if (!code || !codeVerifier || !redirectUri) {
+    toError(res, 400, "code, code_verifier and redirect_uri are required");
+    return;
+  }
+
+  try {
+    const githubAccessToken = await exchangeGithubCode(githubClientId, githubClientSecret, code, redirectUri, codeVerifier);
+    const result = await upsertUserAndIssueTokens(githubAccessToken);
+    sendAuthSuccess(res, result);
+  } catch (error) {
     if (error instanceof Error && error.message === "GITHUB_TOKEN_EXCHANGE_FAILED") {
       toError(res, 502, "GitHub token exchange failed");
       return;
