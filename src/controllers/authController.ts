@@ -387,3 +387,44 @@ export const logout = async (req: Request, res: Response): Promise<void> => {
     toError(res, 500, "Server failure");
   }
 };
+
+export const me = async (req: Request, res: Response): Promise<void> => {
+  const authUser = req.authUser;
+  if (!authUser) {
+    toError(res, 401, "Authentication required");
+    return;
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at
+       FROM users
+       WHERE id = $1
+       LIMIT 1`,
+      [authUser.id]
+    );
+
+    const user = result.rows[0];
+    if (!user) {
+      toError(res, 404, "User not found");
+      return;
+    }
+
+    res.status(200).json({
+      status: "success",
+      data: {
+        id: String(user.id),
+        github_id: String(user.github_id),
+        username: String(user.username),
+        email: user.email ? String(user.email) : null,
+        avatar_url: user.avatar_url ? String(user.avatar_url) : null,
+        role: String(user.role) as Role,
+        is_active: Boolean(user.is_active),
+        last_login_at: toIso(user.last_login_at),
+        created_at: toIso(user.created_at)
+      }
+    });
+  } catch {
+    toError(res, 500, "Server failure");
+  }
+};

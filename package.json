@@ -6,8 +6,10 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch --exclude data/** --exclude dist/** src/server.ts",
+    "lint": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "test": "echo \"No tests configured\""
   },
   "keywords": [],
   "author": "",
