@@ -1,9 +1,9 @@
-import express, { Request, Response } from "express";
+import "dotenv/config";
+import express, { NextFunction, Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
-import { open, Database } from "sqlite";
-import sqlite3 from "sqlite3";
+import { createHash, randomBytes } from "node:crypto";
+import { Pool, PoolClient } from "pg";
 
 type GenderizeResponse = {
   count: number | null;
@@ -49,24 +49,120 @@ type ParsedFilters = {
   min_country_probability?: number;
 };
 
-type CursorPayload = {
-  created_at: string;
-  id: string;
+type PagingAndSort = {
+  page: number;
+  limit: number;
+  sortBy: "age" | "created_at" | "gender_probability";
+  order: "asc" | "desc";
 };
+
+type Role = "admin" | "analyst";
+
+type AuthUser = {
+  id: string;
+  github_id: string;
+  username: string;
+  email: string | null;
+  avatar_url: string | null;
+  role: Role;
+  is_active: boolean;
+};
+
+type Queryable = {
+  query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>;
+};
+
+declare global {
+  namespace Express {
+    interface Request {
+      authUser?: AuthUser;
+    }
+  }
+}
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3021;
 const REQUEST_TIMEOUT_MS = 5000;
-const DB_DIR = process.env.DB_DIR ? path.resolve(process.env.DB_DIR) : path.resolve(process.cwd(), "data");
-const DB_PATH = path.resolve(DB_DIR, "profiles.db");
 const SEED_PATH = path.resolve(process.cwd(), "seed_profiles.json");
 const ALLOWED_AGE_GROUPS = new Set(["child", "teenager", "adult", "senior"]);
 const ALLOWED_SORT_COLUMNS = new Set(["age", "created_at", "gender_probability"]);
 const ALLOWED_ORDER = new Set(["asc", "desc"]);
+const ACCESS_TOKEN_TTL_MS = 3 * 60 * 1000;
+const REFRESH_TOKEN_TTL_MS = 5 * 60 * 1000;
+const PKCE_STATE_TTL_MS = 10 * 60 * 1000;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 120;
+
+const databaseUrl = process.env.DATABASE_URL;
+if (!databaseUrl) {
+  throw new Error("DATABASE_URL is required");
+}
+
+const pool = new Pool({
+  connectionString: databaseUrl,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+const rateStore = new Map<string, { count: number; windowStart: number }>();
 
 app.use(express.json());
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Version");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  if (req.method === "OPTIONS") {
+    res.status(204).send();
+    return;
+  }
+  next();
+});
+
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const current = rateStore.get(ip);
+
+  if (!current || now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateStore.set(ip, { count: 1, windowStart: now });
+  } else {
+    current.count += 1;
+    if (current.count > RATE_LIMIT_MAX_REQUESTS) {
+      toError(res, 429, "Too many requests");
+      return;
+    }
+  }
+
+  // Opportunistic cleanup to keep memory bounded.
+  if (rateStore.size > 10_000) {
+    const cutoff = now - RATE_LIMIT_WINDOW_MS;
+    for (const [key, value] of rateStore.entries()) {
+      if (value.windowStart < cutoff) {
+        rateStore.delete(key);
+      }
+    }
+  }
+
+  next();
+});
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    const durationMs = Date.now() - startedAt;
+    console.info(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        duration_ms: durationMs,
+        user_id: req.authUser?.id ?? null,
+        ip: req.ip || req.socket.remoteAddress || "unknown"
+      })
+    );
+  });
   next();
 });
 
@@ -89,6 +185,40 @@ const generateUuidV7 = (): string => {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 };
 
+const hashToken = (rawToken: string): string => {
+  return createHash("sha256").update(rawToken).digest("hex");
+};
+
+const createOpaqueToken = (): string => {
+  return randomBytes(48).toString("base64url");
+};
+
+const createPkceChallenge = (codeVerifier: string): string => {
+  return createHash("sha256").update(codeVerifier).digest("base64url");
+};
+
+const toIso = (value: unknown): string => {
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return new Date(String(value)).toISOString();
+};
+
+const normalizeProfileRow = (row: Record<string, unknown>): ProfileRow => {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    gender: String(row.gender) as ProfileRow["gender"],
+    gender_probability: Number(row.gender_probability),
+    age: Number(row.age),
+    age_group: String(row.age_group) as ProfileRow["age_group"],
+    country_id: String(row.country_id),
+    country_name: String(row.country_name),
+    country_probability: Number(row.country_probability),
+    created_at: toIso(row.created_at)
+  };
+};
+
 const getAgeGroup = (age: number): "child" | "teenager" | "adult" | "senior" => {
   if (age <= 12) return "child";
   if (age <= 19) return "teenager";
@@ -104,9 +234,11 @@ const parseName = (name: unknown): { value?: string; code?: number; message?: st
   return { value };
 };
 
-const fetchJson = async <T>(url: string): Promise<T> => {
-  const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-  if (!response.ok) throw new Error("UPSTREAM_STATUS_ERROR");
+const fetchJson = async <T>(url: string, headers?: Record<string, string>): Promise<T> => {
+  const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS), headers });
+  if (!response.ok) {
+    throw new Error("UPSTREAM_STATUS_ERROR");
+  }
   return (await response.json()) as T;
 };
 
@@ -153,42 +285,37 @@ const getInvalidUpstreamError = (error: unknown): string | null => {
   return null;
 };
 
-const isSqliteUniqueNameConflict = (error: unknown): boolean => {
-  if (!(error instanceof Error)) return false;
-  const maybeCode = (error as { code?: unknown }).code;
-  return maybeCode === "SQLITE_CONSTRAINT" || error.message.includes("UNIQUE constraint failed: profiles.name");
-};
-
 const buildWhereClause = (filters: ParsedFilters): { clause: string; values: Array<string | number> } => {
   const where: string[] = [];
   const values: Array<string | number> = [];
+  let index = 1;
 
   if (filters.gender) {
-    where.push("gender = ?");
+    where.push(`gender = $${index++}`);
     values.push(filters.gender);
   }
   if (filters.age_group) {
-    where.push("age_group = ?");
+    where.push(`age_group = $${index++}`);
     values.push(filters.age_group);
   }
   if (filters.country_id) {
-    where.push("country_id = ?");
+    where.push(`country_id = $${index++}`);
     values.push(filters.country_id);
   }
   if (typeof filters.min_age === "number") {
-    where.push("age >= ?");
+    where.push(`age >= $${index++}`);
     values.push(filters.min_age);
   }
   if (typeof filters.max_age === "number") {
-    where.push("age <= ?");
+    where.push(`age <= $${index++}`);
     values.push(filters.max_age);
   }
   if (typeof filters.min_gender_probability === "number") {
-    where.push("gender_probability >= ?");
+    where.push(`gender_probability >= $${index++}`);
     values.push(filters.min_gender_probability);
   }
   if (typeof filters.min_country_probability === "number") {
-    where.push("country_probability >= ?");
+    where.push(`country_probability >= $${index++}`);
     values.push(filters.min_country_probability);
   }
 
@@ -280,35 +407,21 @@ const parseFilterQuery = (query: Request["query"]): ParsedFilters | null => {
   return filters;
 };
 
-const parsePagingAndSort = (
-  query: Request["query"]
-): {
-  page?: number;
-  limit: number;
-  sortBy: "age" | "created_at" | "gender_probability";
-  order: "asc" | "desc";
-  cursor?: CursorPayload;
-} | null => {
+const parsePagingAndSort = (query: Request["query"]): PagingAndSort | null => {
   const pageRaw = query.page;
   const limitRaw = query.limit;
   const sortByRaw = query.sort_by;
   const orderRaw = query.order;
-  const cursorRaw = query.cursor;
 
-  if (
-    Array.isArray(pageRaw) ||
-    Array.isArray(limitRaw) ||
-    Array.isArray(sortByRaw) ||
-    Array.isArray(orderRaw) ||
-    Array.isArray(cursorRaw)
-  ) {
+  if (Array.isArray(pageRaw) || Array.isArray(limitRaw) || Array.isArray(sortByRaw) || Array.isArray(orderRaw)) {
     return null;
   }
 
+  const page = pageRaw === undefined ? 1 : Number(pageRaw);
   const limit = limitRaw === undefined ? 10 : Number(limitRaw);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
-    return null;
-  }
+
+  if (!Number.isInteger(page) || page < 1) return null;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 50) return null;
 
   const sortBy = (typeof sortByRaw === "string" ? sortByRaw.trim().toLowerCase() : "created_at") as
     | "age"
@@ -318,70 +431,10 @@ const parsePagingAndSort = (
 
   if (!ALLOWED_SORT_COLUMNS.has(sortBy) || !ALLOWED_ORDER.has(order)) return null;
 
-  let cursor: CursorPayload | undefined;
-  if (cursorRaw !== undefined) {
-    if (typeof cursorRaw !== "string" || !cursorRaw.trim()) return null;
-    if (sortBy !== "created_at") return null;
-    if (pageRaw !== undefined) return null;
-
-    try {
-      const decoded = Buffer.from(cursorRaw, "base64url").toString("utf8");
-      const parsed = JSON.parse(decoded) as CursorPayload;
-      if (
-        !parsed ||
-        typeof parsed !== "object" ||
-        typeof parsed.created_at !== "string" ||
-        !parsed.created_at ||
-        typeof parsed.id !== "string" ||
-        !parsed.id
-      ) {
-        return null;
-      }
-      cursor = parsed;
-    } catch {
-      return null;
-    }
-  }
-
-  if (cursor) {
-    return { limit, sortBy, order, cursor };
-  }
-
-  const page = pageRaw === undefined ? 1 : Number(pageRaw);
-  if (!Number.isInteger(page) || page < 1) return null;
-
   return { page, limit, sortBy, order };
 };
 
-const encodeCursor = (row: Pick<ProfileRow, "created_at" | "id">): string => {
-  return Buffer.from(
-    JSON.stringify({
-      created_at: row.created_at,
-      id: row.id
-    }),
-    "utf8"
-  ).toString("base64url");
-};
-
-const appendCursorCondition = (
-  whereClause: string,
-  order: "asc" | "desc",
-  cursor: CursorPayload,
-  values: Array<string | number>
-): string => {
-  values.push(cursor.created_at, cursor.created_at, cursor.id);
-  const comparator = order === "asc" ? ">" : "<";
-  const start = values.length - 2;
-  const cursorCondition = `(created_at ${comparator} ? OR (created_at = ? AND id ${comparator} ?))`;
-
-  if (!whereClause) {
-    return `WHERE ${cursorCondition}`;
-  }
-
-  return `${whereClause} AND ${cursorCondition}`;
-};
-
-const parseNaturalLanguageQuery = async (db: Database, rawQuery: string): Promise<ParsedFilters | null> => {
+const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promise<ParsedFilters | null> => {
   const q = rawQuery.toLowerCase().trim().replace(/\s+/g, " ");
   if (!q) return null;
 
@@ -410,12 +463,13 @@ const parseNaturalLanguageQuery = async (db: Database, rawQuery: string): Promis
   const from = q.match(/\bfrom\s+([a-z ]+?)\b(?:\s+(?:with|and|above|below|under|over|older|younger)|$)/);
   if (from) {
     const countryName = from[1].trim().replace(/\s+/g, " ");
-    const row = await db.get<{ country_id: string }>(
-      "SELECT country_id FROM profiles WHERE LOWER(country_name) = LOWER(?) LIMIT 1",
-      countryName
+    const result = await db.query(
+      "SELECT country_id FROM profiles WHERE LOWER(country_name) = LOWER($1) LIMIT 1",
+      [countryName]
     );
-    if (row) {
-      filters.country_id = row.country_id;
+    const row = result.rows[0];
+    if (row?.country_id) {
+      filters.country_id = String(row.country_id);
     } else {
       return null;
     }
@@ -434,52 +488,202 @@ const parseNaturalLanguageQuery = async (db: Database, rawQuery: string): Promis
   return filters;
 };
 
-const initializeDatabase = async (): Promise<Database> => {
-  fs.mkdirSync(DB_DIR, { recursive: true });
-  const db = await open({ filename: DB_PATH, driver: sqlite3.Database });
+const buildPaginationLinks = (req: Request, page: number, limit: number, totalPages: number) => {
+  const build = (targetPage: number | null): string | null => {
+    if (targetPage === null) return null;
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(req.query)) {
+      if (typeof value === "string") {
+        params.set(key, value);
+      }
+    }
+    params.set("page", String(targetPage));
+    params.set("limit", String(limit));
+    return `${req.path}?${params.toString()}`;
+  };
 
-  const tableExists = await db.get<{ name: string }>(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'profiles'"
+  return {
+    self: build(page),
+    next: totalPages > 0 && page < totalPages ? build(page + 1) : null,
+    prev: page > 1 && totalPages > 0 ? build(page - 1) : null
+  };
+};
+
+const toCsvValue = (value: string | number): string => {
+  const asString = String(value);
+  if (asString.includes(",") || asString.includes("\"") || asString.includes("\n")) {
+    return `"${asString.replace(/\"/g, "\"\"")}"`;
+  }
+  return asString;
+};
+
+const profilesToCsv = (rows: ProfileRow[]): string => {
+  const headers = [
+    "id",
+    "name",
+    "gender",
+    "gender_probability",
+    "age",
+    "age_group",
+    "country_id",
+    "country_name",
+    "country_probability",
+    "created_at"
+  ];
+
+  const body = rows.map((row) =>
+    [
+      row.id,
+      row.name,
+      row.gender,
+      row.gender_probability,
+      row.age,
+      row.age_group,
+      row.country_id,
+      row.country_name,
+      row.country_probability,
+      row.created_at
+    ]
+      .map((cell) => toCsvValue(cell))
+      .join(",")
   );
 
-  if (tableExists) {
-    const columns = await db.all<Array<{ name: string }>>("PRAGMA table_info(profiles)");
-    const existingColumnSet = new Set(columns.map((column) => column.name));
-    const requiredColumns = [
-      "id",
-      "name",
-      "gender",
-      "gender_probability",
-      "age",
-      "age_group",
-      "country_id",
-      "country_name",
-      "country_probability",
-      "created_at"
-    ];
-    const isCompatible =
-      requiredColumns.every((column) => existingColumnSet.has(column)) && !existingColumnSet.has("sample_size");
+  return [headers.join(","), ...body].join("\n");
+};
 
-    if (!isCompatible) {
-      await db.exec("DROP TABLE profiles;");
+const issueTokenPair = async (
+  db: PoolClient,
+  userId: string
+): Promise<{ accessToken: string; refreshToken: string; accessTokenHash: string; refreshTokenHash: string }> => {
+  const accessToken = createOpaqueToken();
+  const refreshToken = createOpaqueToken();
+  const accessTokenHash = hashToken(accessToken);
+  const refreshTokenHash = hashToken(refreshToken);
+
+  await db.query(
+    `INSERT INTO access_tokens (id, user_id, token_hash, expires_at)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '3 minutes')`,
+    [generateUuidV7(), userId, accessTokenHash]
+  );
+
+  await db.query(
+    `INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
+     VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes')`,
+    [generateUuidV7(), userId, refreshTokenHash]
+  );
+
+  return {
+    accessToken,
+    refreshToken,
+    accessTokenHash,
+    refreshTokenHash
+  };
+};
+
+const authenticateAccessToken = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const authorization = req.header("Authorization");
+    if (!authorization || !authorization.startsWith("Bearer ")) {
+      toError(res, 401, "Authentication required");
+      return;
     }
-  }
 
-  await db.exec(`
+    const token = authorization.slice("Bearer ".length).trim();
+    if (!token) {
+      toError(res, 401, "Authentication required");
+      return;
+    }
+
+    const tokenHash = hashToken(token);
+    const result = await pool.query(
+      `SELECT
+        u.id,
+        u.github_id,
+        u.username,
+        u.email,
+        u.avatar_url,
+        u.role,
+        u.is_active
+       FROM access_tokens at
+       JOIN users u ON u.id = at.user_id
+       WHERE at.token_hash = $1
+         AND at.is_revoked = FALSE
+         AND at.expires_at > NOW()
+       LIMIT 1`,
+      [tokenHash]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      toError(res, 401, "Invalid or expired access token");
+      return;
+    }
+
+    if (!row.is_active) {
+      toError(res, 403, "User account is inactive");
+      return;
+    }
+
+    req.authUser = {
+      id: String(row.id),
+      github_id: String(row.github_id),
+      username: String(row.username),
+      email: row.email ? String(row.email) : null,
+      avatar_url: row.avatar_url ? String(row.avatar_url) : null,
+      role: String(row.role) as Role,
+      is_active: Boolean(row.is_active)
+    };
+
+    next();
+  } catch {
+    toError(res, 500, "Server failure");
+  }
+};
+
+const authorizeRoles = (...allowedRoles: Role[]) => {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const user = req.authUser;
+    if (!user) {
+      toError(res, 401, "Authentication required");
+      return;
+    }
+
+    if (!allowedRoles.includes(user.role)) {
+      toError(res, 403, "Forbidden");
+      return;
+    }
+
+    next();
+  };
+};
+
+const requireApiVersion = (req: Request, res: Response, next: NextFunction): void => {
+  const version = req.header("X-API-Version");
+  if (version !== "1") {
+    toError(res, 400, "API version header required");
+    return;
+  }
+  next();
+};
+
+const initializeDatabase = async (): Promise<void> => {
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS profiles (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      id UUID PRIMARY KEY,
+      name TEXT NOT NULL,
       gender TEXT NOT NULL,
-      gender_probability REAL NOT NULL,
+      gender_probability DOUBLE PRECISION NOT NULL,
       age INTEGER NOT NULL,
       age_group TEXT NOT NULL,
       country_id TEXT NOT NULL,
       country_name TEXT NOT NULL,
-      country_probability REAL NOT NULL,
-      created_at TEXT NOT NULL
+      country_probability DOUBLE PRECISION NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  await db.exec(`
+
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_profiles_name_lower ON profiles (LOWER(name));
     CREATE INDEX IF NOT EXISTS idx_profiles_gender ON profiles(gender);
     CREATE INDEX IF NOT EXISTS idx_profiles_age_group ON profiles(age_group);
     CREATE INDEX IF NOT EXISTS idx_profiles_country_id ON profiles(country_id);
@@ -491,67 +695,399 @@ const initializeDatabase = async (): Promise<Database> => {
     CREATE INDEX IF NOT EXISTS idx_profiles_country_name_lower ON profiles(LOWER(country_name));
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id UUID PRIMARY KEY,
+      github_id VARCHAR(128) NOT NULL UNIQUE,
+      username VARCHAR(255) NOT NULL,
+      email VARCHAR(255),
+      avatar_url TEXT,
+      role VARCHAR(20) NOT NULL DEFAULT 'analyst' CHECK (role IN ('admin', 'analyst')),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,
+      last_login_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS oauth_pkce_states (
+      state VARCHAR(255) PRIMARY KEY,
+      code_verifier TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      is_revoked BOOLEAN NOT NULL DEFAULT FALSE,
+      replaced_by_token_hash TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_refresh_tokens_token_hash ON refresh_tokens(token_hash);
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS access_tokens (
+      id UUID PRIMARY KEY,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      is_revoked BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_access_tokens_token_hash ON access_tokens(token_hash);
+  `);
+
   const seedRaw = fs.readFileSync(SEED_PATH, "utf8");
   const seedData = JSON.parse(seedRaw) as { profiles?: SeedProfile[] };
   const rows = Array.isArray(seedData.profiles) ? seedData.profiles : [];
 
-  const existingRowCount = await db.get<{ total: number }>("SELECT COUNT(*) as total FROM profiles");
-  const existingTotal = Number(existingRowCount?.total ?? 0);
+  const countResult = await pool.query("SELECT COUNT(*)::int AS total FROM profiles");
+  const existingTotal = Number(countResult.rows[0]?.total ?? 0);
   if (existingTotal >= rows.length) {
-    return db;
+    return;
   }
 
-  for (const profile of rows) {
-    await db.run(
-      `INSERT OR IGNORE INTO profiles (
-        id, name, gender, gender_probability, age, age_group,
-        country_id, country_name, country_probability, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      generateUuidV7(),
-      String(profile.name).trim().toLowerCase(),
-      profile.gender,
-      Number(profile.gender_probability),
-      Number(profile.age),
-      profile.age_group,
-      String(profile.country_id).toUpperCase(),
-      String(profile.country_name).trim(),
-      Number(profile.country_probability),
-      new Date().toISOString()
-    );
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const profile of rows) {
+      await client.query(
+        `INSERT INTO profiles (
+           id, name, gender, gender_probability, age, age_group,
+           country_id, country_name, country_probability, created_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+         ON CONFLICT (LOWER(name)) DO NOTHING`,
+        [
+          generateUuidV7(),
+          String(profile.name).trim().toLowerCase(),
+          profile.gender,
+          Number(profile.gender_probability),
+          Number(profile.age),
+          profile.age_group,
+          String(profile.country_id).toUpperCase(),
+          String(profile.country_name).trim(),
+          Number(profile.country_probability)
+        ]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
-
-  return db;
-};
-
-let dbPromise: Promise<Database> | null = null;
-const getDb = (): Promise<Database> => {
-  if (!dbPromise) dbPromise = initializeDatabase();
-  return dbPromise;
 };
 
 app.get("/health", (_req: Request, res: Response) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.post("/api/profiles", async (req: Request, res: Response) => {
-  const parsedName = parseName(req.body?.name);
-  if (!parsedName.value) return toError(res, parsedName.code ?? 400, parsedName.message ?? "Missing or empty parameter");
+app.get("/auth/github", async (_req: Request, res: Response) => {
+  const githubClientId = process.env.GITHUB_CLIENT_ID;
+  const githubRedirectUri = process.env.GITHUB_REDIRECT_URI;
+
+  if (!githubClientId || !githubRedirectUri) {
+    toError(res, 500, "GitHub OAuth is not configured");
+    return;
+  }
+
+  const state = randomBytes(24).toString("base64url");
+  const codeVerifier = randomBytes(64).toString("base64url");
+  const codeChallenge = createPkceChallenge(codeVerifier);
+
+  await pool.query(
+    `INSERT INTO oauth_pkce_states (state, code_verifier, expires_at)
+     VALUES ($1, $2, NOW() + INTERVAL '10 minutes')`,
+    [state, codeVerifier]
+  );
+
+  const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
+  authorizeUrl.searchParams.set("client_id", githubClientId);
+  authorizeUrl.searchParams.set("redirect_uri", githubRedirectUri);
+  authorizeUrl.searchParams.set("scope", process.env.GITHUB_SCOPE || "read:user user:email");
+  authorizeUrl.searchParams.set("state", state);
+  authorizeUrl.searchParams.set("code_challenge", codeChallenge);
+  authorizeUrl.searchParams.set("code_challenge_method", "S256");
+
+  res.redirect(authorizeUrl.toString());
+});
+
+app.get("/auth/github/callback", async (req: Request, res: Response) => {
+  const githubClientId = process.env.GITHUB_CLIENT_ID;
+  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
+  const githubRedirectUri = process.env.GITHUB_REDIRECT_URI;
+
+  if (!githubClientId || !githubClientSecret || !githubRedirectUri) {
+    toError(res, 500, "GitHub OAuth is not configured");
+    return;
+  }
+
+  if (Array.isArray(req.query.code) || Array.isArray(req.query.state)) {
+    toError(res, 400, "Invalid OAuth callback parameters");
+    return;
+  }
+
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+  const state = typeof req.query.state === "string" ? req.query.state : "";
+
+  if (!code || !state) {
+    toError(res, 400, "Invalid OAuth callback parameters");
+    return;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const pkceResult = await client.query(
+      `SELECT code_verifier
+       FROM oauth_pkce_states
+       WHERE state = $1 AND expires_at > NOW()
+       LIMIT 1`,
+      [state]
+    );
+
+    const pkceState = pkceResult.rows[0];
+    if (!pkceState?.code_verifier) {
+      await client.query("ROLLBACK");
+      toError(res, 400, "Invalid or expired OAuth state");
+      return;
+    }
+
+    await client.query("DELETE FROM oauth_pkce_states WHERE state = $1", [state]);
+
+    const tokenResponse = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        client_id: githubClientId,
+        client_secret: githubClientSecret,
+        code,
+        redirect_uri: githubRedirectUri,
+        code_verifier: String(pkceState.code_verifier)
+      }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    });
+
+    if (!tokenResponse.ok) {
+      await client.query("ROLLBACK");
+      toError(res, 502, "GitHub token exchange failed");
+      return;
+    }
+
+    const tokenPayload = (await tokenResponse.json()) as { access_token?: string; error?: string };
+    if (!tokenPayload.access_token) {
+      await client.query("ROLLBACK");
+      toError(res, 502, "GitHub token exchange failed");
+      return;
+    }
+
+    const githubUser = (await fetchJson<{
+      id: number;
+      login: string;
+      avatar_url: string;
+      email: string | null;
+    }>("https://api.github.com/user", {
+      Authorization: `Bearer ${tokenPayload.access_token}`,
+      "User-Agent": "insighta-labs-plus"
+    })) as {
+      id: number;
+      login: string;
+      avatar_url: string;
+      email: string | null;
+    };
+
+    let email = githubUser.email;
+    if (!email) {
+      try {
+        const emailResult = await fetchJson<Array<{ email: string; primary: boolean; verified: boolean }>>(
+          "https://api.github.com/user/emails",
+          {
+            Authorization: `Bearer ${tokenPayload.access_token}`,
+            "User-Agent": "insighta-labs-plus"
+          }
+        );
+        const primaryVerified = emailResult.find((item) => item.primary && item.verified);
+        email = primaryVerified?.email ?? null;
+      } catch {
+        email = null;
+      }
+    }
+
+    const userResult = await client.query(
+      `INSERT INTO users (
+        id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at
+       ) VALUES ($1, $2, $3, $4, $5, 'analyst', TRUE, NOW(), NOW())
+       ON CONFLICT (github_id)
+       DO UPDATE SET
+         username = EXCLUDED.username,
+         email = EXCLUDED.email,
+         avatar_url = EXCLUDED.avatar_url,
+         last_login_at = NOW()
+       RETURNING id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at`,
+      [generateUuidV7(), String(githubUser.id), githubUser.login, email, githubUser.avatar_url]
+    );
+
+    const user = userResult.rows[0];
+    const tokenPair = await issueTokenPair(client, String(user.id));
+
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      status: "success",
+      access_token: tokenPair.accessToken,
+      refresh_token: tokenPair.refreshToken,
+      access_token_expires_in_seconds: 180,
+      refresh_token_expires_in_seconds: 300,
+      data: {
+        id: String(user.id),
+        github_id: String(user.github_id),
+        username: String(user.username),
+        email: user.email ? String(user.email) : null,
+        avatar_url: user.avatar_url ? String(user.avatar_url) : null,
+        role: String(user.role),
+        is_active: Boolean(user.is_active),
+        last_login_at: toIso(user.last_login_at),
+        created_at: toIso(user.created_at)
+      }
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+      toError(res, 502, "GitHub request timeout");
+      return;
+    }
+    toError(res, 500, "Server failure");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/auth/refresh", async (req: Request, res: Response) => {
+  const refreshToken = req.body?.refresh_token;
+  if (typeof refreshToken !== "string" || !refreshToken.trim()) {
+    toError(res, 400, "refresh_token is required");
+    return;
+  }
+
+  const refreshTokenHash = hashToken(refreshToken);
+  const client = await pool.connect();
 
   try {
-    const db = await getDb();
-    const existing = await db.get<ProfileRow>("SELECT * FROM profiles WHERE name = ? COLLATE NOCASE", parsedName.value);
+    await client.query("BEGIN");
+
+    const tokenResult = await client.query(
+      `SELECT rt.id, rt.user_id, u.is_active
+       FROM refresh_tokens rt
+       JOIN users u ON u.id = rt.user_id
+       WHERE rt.token_hash = $1
+         AND rt.is_revoked = FALSE
+         AND rt.expires_at > NOW()
+       LIMIT 1`,
+      [refreshTokenHash]
+    );
+
+    const tokenRow = tokenResult.rows[0];
+    if (!tokenRow) {
+      await client.query("ROLLBACK");
+      toError(res, 401, "Invalid or expired refresh token");
+      return;
+    }
+
+    if (!tokenRow.is_active) {
+      await client.query("ROLLBACK");
+      toError(res, 403, "User account is inactive");
+      return;
+    }
+
+    const newTokenPair = await issueTokenPair(client, String(tokenRow.user_id));
+
+    await client.query(
+      `UPDATE refresh_tokens
+       SET is_revoked = TRUE,
+           replaced_by_token_hash = $2
+       WHERE id = $1`,
+      [tokenRow.id, newTokenPair.refreshTokenHash]
+    );
+
+    await client.query("COMMIT");
+
+    res.status(200).json({
+      status: "success",
+      access_token: newTokenPair.accessToken,
+      refresh_token: newTokenPair.refreshToken,
+      access_token_expires_in_seconds: 180,
+      refresh_token_expires_in_seconds: 300
+    });
+  } catch {
+    await client.query("ROLLBACK");
+    toError(res, 500, "Server failure");
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/auth/logout", async (req: Request, res: Response) => {
+  const refreshToken = req.body?.refresh_token;
+  if (typeof refreshToken !== "string" || !refreshToken.trim()) {
+    toError(res, 400, "refresh_token is required");
+    return;
+  }
+
+  try {
+    const refreshTokenHash = hashToken(refreshToken);
+    await pool.query(
+      `UPDATE refresh_tokens
+       SET is_revoked = TRUE
+       WHERE token_hash = $1 AND is_revoked = FALSE`,
+      [refreshTokenHash]
+    );
+
+    res.status(200).json({
+      status: "success",
+      message: "Logged out"
+    });
+  } catch {
+    toError(res, 500, "Server failure");
+  }
+});
+
+app.use("/api", authenticateAccessToken);
+app.use("/api/profiles", requireApiVersion);
+
+app.post("/api/profiles", authorizeRoles("admin"), async (req: Request, res: Response) => {
+  const parsedName = parseName(req.body?.name);
+  if (!parsedName.value) {
+    toError(res, parsedName.code ?? 400, parsedName.message ?? "Missing or empty parameter");
+    return;
+  }
+
+  try {
+    const existingResult = await pool.query("SELECT * FROM profiles WHERE LOWER(name) = LOWER($1) LIMIT 1", [
+      parsedName.value
+    ]);
+    const existing = existingResult.rows[0];
     if (existing) {
-      return res.status(200).json({ status: "success", message: "Profile already exists", data: existing });
+      res.status(200).json({ status: "success", message: "Profile already exists", data: normalizeProfileRow(existing) });
+      return;
     }
 
     const external = await getExternalData(parsedName.value);
-    const countryName =
-      (
-        await db.get<{ country_name: string }>(
-          "SELECT country_name FROM profiles WHERE country_id = ? LIMIT 1",
-          external.countryId
-        )
-      )?.country_name ?? external.countryId;
+    const countryResult = await pool.query("SELECT country_name FROM profiles WHERE country_id = $1 LIMIT 1", [
+      external.countryId
+    ]);
 
     const profile: ProfileRow = {
       id: generateUuidV7(),
@@ -561,186 +1097,217 @@ app.post("/api/profiles", async (req: Request, res: Response) => {
       age: external.age,
       age_group: external.ageGroup,
       country_id: external.countryId,
-      country_name: countryName,
+      country_name: countryResult.rows[0]?.country_name ? String(countryResult.rows[0].country_name) : external.countryId,
       country_probability: external.countryProbability,
       created_at: new Date().toISOString()
     };
 
     try {
-      await db.run(
+      await pool.query(
         `INSERT INTO profiles (
           id, name, gender, gender_probability, age, age_group,
           country_id, country_name, country_probability, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        profile.id,
-        profile.name,
-        profile.gender,
-        profile.gender_probability,
-        profile.age,
-        profile.age_group,
-        profile.country_id,
-        profile.country_name,
-        profile.country_probability,
-        profile.created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          profile.id,
+          profile.name,
+          profile.gender,
+          profile.gender_probability,
+          profile.age,
+          profile.age_group,
+          profile.country_id,
+          profile.country_name,
+          profile.country_probability,
+          profile.created_at
+        ]
       );
     } catch (insertError) {
-      if (isSqliteUniqueNameConflict(insertError)) {
-        const existingAfterConflict = await db.get<ProfileRow>(
-          "SELECT * FROM profiles WHERE name = ? COLLATE NOCASE",
+      if ((insertError as { code?: string }).code === "23505") {
+        const existingAfterConflict = await pool.query("SELECT * FROM profiles WHERE LOWER(name) = LOWER($1) LIMIT 1", [
           parsedName.value
-        );
-        if (existingAfterConflict) {
-          return res.status(200).json({
+        ]);
+        if (existingAfterConflict.rows[0]) {
+          res.status(200).json({
             status: "success",
             message: "Profile already exists",
-            data: existingAfterConflict
+            data: normalizeProfileRow(existingAfterConflict.rows[0])
           });
+          return;
         }
       }
       throw insertError;
     }
 
-    return res.status(201).json({ status: "success", data: profile });
+    res.status(201).json({ status: "success", data: profile });
   } catch (error) {
     const upstreamMessage = getInvalidUpstreamError(error);
-    if (upstreamMessage) return toError(res, 502, upstreamMessage);
+    if (upstreamMessage) {
+      toError(res, 502, upstreamMessage);
+      return;
+    }
     if (
       error instanceof TypeError ||
       (error instanceof Error &&
         (error.message === "UPSTREAM_STATUS_ERROR" || error.name === "TimeoutError" || error.name === "AbortError"))
     ) {
-      return toError(res, 502, "Upstream service failure");
+      toError(res, 502, "Upstream service failure");
+      return;
     }
-    return toError(res, 500, "Server failure");
+    toError(res, 500, "Server failure");
   }
 });
 
-app.get("/api/profiles/search", async (req: Request, res: Response) => {
+app.get("/api/profiles/search", authorizeRoles("admin", "analyst"), async (req: Request, res: Response) => {
   try {
     if (Array.isArray(req.query.q) || typeof req.query.q !== "string" || !req.query.q.trim()) {
-      return toError(res, 400, "Missing or empty parameter");
+      toError(res, 400, "Missing or empty parameter");
+      return;
     }
 
     const pageRaw = req.query.page;
     const limitRaw = req.query.limit;
-    if (Array.isArray(pageRaw) || Array.isArray(limitRaw)) return toError(res, 422, "Invalid query parameters");
+    if (Array.isArray(pageRaw) || Array.isArray(limitRaw)) {
+      toError(res, 422, "Invalid query parameters");
+      return;
+    }
 
     const page = pageRaw === undefined ? 1 : Number(pageRaw);
     const limit = limitRaw === undefined ? 10 : Number(limitRaw);
     if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 50) {
-      return toError(res, 422, "Invalid query parameters");
+      toError(res, 422, "Invalid query parameters");
+      return;
     }
 
-    const db = await getDb();
-    const interpreted = await parseNaturalLanguageQuery(db, req.query.q);
-    if (!interpreted) return toError(res, 400, "Unable to interpret query");
+    const interpreted = await parseNaturalLanguageQuery(pool, req.query.q);
+    if (!interpreted) {
+      toError(res, 400, "Unable to interpret query");
+      return;
+    }
 
     const { clause, values } = buildWhereClause(interpreted);
     const offset = (page - 1) * limit;
-    const totalRow = await db.get<{ total: number }>(
-      `SELECT COUNT(*) as total FROM profiles ${clause}`,
-      ...values
-    );
-    const rows = await db.all<ProfileRow[]>(
-      `SELECT * FROM profiles ${clause} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-      ...values,
-      limit,
-      offset
+
+    const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values);
+    const total = Number(totalResult.rows[0]?.total ?? 0);
+
+    const listResult = await pool.query(
+      `SELECT * FROM profiles ${clause} ORDER BY created_at DESC, id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      [...values, limit, offset]
     );
 
-    return res.status(200).json({
+    const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+
+    res.status(200).json({
       status: "success",
       page,
       limit,
-      total: Number(totalRow?.total ?? 0),
-      data: rows
+      total,
+      total_pages: totalPages,
+      links: buildPaginationLinks(req, page, limit, totalPages),
+      data: listResult.rows.map((row) => normalizeProfileRow(row))
     });
   } catch {
-    return toError(res, 500, "Server failure");
+    toError(res, 500, "Server failure");
   }
 });
 
-app.get("/api/profiles/:id", async (req: Request, res: Response) => {
+app.get("/api/profiles/:id", authorizeRoles("admin", "analyst"), async (req: Request, res: Response) => {
   try {
-    const db = await getDb();
-    const profile = await db.get<ProfileRow>("SELECT * FROM profiles WHERE id = ?", req.params.id);
-    if (!profile) return toError(res, 404, "Profile not found");
-    return res.status(200).json({ status: "success", data: profile });
+    const result = await pool.query("SELECT * FROM profiles WHERE id = $1 LIMIT 1", [req.params.id]);
+    const profile = result.rows[0];
+    if (!profile) {
+      toError(res, 404, "Profile not found");
+      return;
+    }
+    res.status(200).json({ status: "success", data: normalizeProfileRow(profile) });
   } catch {
-    return toError(res, 500, "Server failure");
+    toError(res, 500, "Server failure");
   }
 });
 
-app.get("/api/profiles", async (req: Request, res: Response) => {
+app.get("/api/profiles", authorizeRoles("admin", "analyst"), async (req: Request, res: Response) => {
   try {
     const parsedFilters = parseFilterQuery(req.query);
     const pageSort = parsePagingAndSort(req.query);
-    if (!parsedFilters || !pageSort) return toError(res, 422, "Invalid query parameters");
-
-    const db = await getDb();
-    const { clause, values } = buildWhereClause(parsedFilters);
-    const orderSql = `ORDER BY ${pageSort.sortBy} ${pageSort.order.toUpperCase()}, id ${pageSort.order.toUpperCase()}`;
-
-    const totalRow = await db.get<{ total: number }>(
-      `SELECT COUNT(*) as total FROM profiles ${clause}`,
-      ...values
-    );
-
-    if (pageSort.cursor) {
-      const cursorValues = [...values];
-      const cursorClause = appendCursorCondition(clause, pageSort.order, pageSort.cursor, cursorValues);
-      const rows = await db.all<ProfileRow[]>(
-        `SELECT * FROM profiles ${cursorClause} ${orderSql} LIMIT ?`,
-        ...cursorValues,
-        pageSort.limit + 1
-      );
-
-      const hasMore = rows.length > pageSort.limit;
-      const data = hasMore ? rows.slice(0, pageSort.limit) : rows;
-      const nextCursor = hasMore && data.length > 0 ? encodeCursor(data[data.length - 1]) : null;
-
-      return res.status(200).json({
-        status: "success",
-        limit: pageSort.limit,
-        total: Number(totalRow?.total ?? 0),
-        next_cursor: nextCursor,
-        data
-      });
+    if (!parsedFilters || !pageSort) {
+      toError(res, 422, "Invalid query parameters");
+      return;
     }
 
-    const offset = ((pageSort.page ?? 1) - 1) * pageSort.limit;
-    const rows = await db.all<ProfileRow[]>(
-      `SELECT * FROM profiles ${clause} ${orderSql} LIMIT ? OFFSET ?`,
-      ...values,
-      pageSort.limit,
-      offset
+    const { clause, values } = buildWhereClause(parsedFilters);
+    const orderBy = `${pageSort.sortBy} ${pageSort.order.toUpperCase()}, id ${pageSort.order.toUpperCase()}`;
+    const offset = (pageSort.page - 1) * pageSort.limit;
+
+    const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values);
+    const total = Number(totalResult.rows[0]?.total ?? 0);
+
+    const listResult = await pool.query(
+      `SELECT * FROM profiles ${clause} ORDER BY ${orderBy} LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+      [...values, pageSort.limit, offset]
     );
 
-    return res.status(200).json({
+    const totalPages = total === 0 ? 0 : Math.ceil(total / pageSort.limit);
+
+    res.status(200).json({
       status: "success",
       page: pageSort.page,
       limit: pageSort.limit,
-      total: Number(totalRow?.total ?? 0),
-      data: rows
+      total,
+      total_pages: totalPages,
+      links: buildPaginationLinks(req, pageSort.page, pageSort.limit, totalPages),
+      data: listResult.rows.map((row) => normalizeProfileRow(row))
     });
   } catch {
-    return toError(res, 500, "Server failure");
+    toError(res, 500, "Server failure");
   }
 });
 
-app.delete("/api/profiles/:id", async (req: Request, res: Response) => {
+app.get("/api/profiles/export", authorizeRoles("admin", "analyst"), async (req: Request, res: Response) => {
   try {
-    const db = await getDb();
-    const result = await db.run("DELETE FROM profiles WHERE id = ?", req.params.id);
-    if (result.changes === 0) return toError(res, 404, "Profile not found");
-    return res.status(204).send();
+    const format = req.query.format;
+    if (format !== "csv") {
+      toError(res, 422, "Invalid export format");
+      return;
+    }
+
+    const parsedFilters = parseFilterQuery(req.query);
+    const pageSort = parsePagingAndSort(req.query);
+    if (!parsedFilters || !pageSort) {
+      toError(res, 422, "Invalid query parameters");
+      return;
+    }
+
+    const { clause, values } = buildWhereClause(parsedFilters);
+    const orderBy = `${pageSort.sortBy} ${pageSort.order.toUpperCase()}, id ${pageSort.order.toUpperCase()}`;
+
+    const result = await pool.query(`SELECT * FROM profiles ${clause} ORDER BY ${orderBy}`, values);
+    const rows = result.rows.map((row) => normalizeProfileRow(row));
+    const csv = profilesToCsv(rows);
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename="profiles_${timestamp}.csv"`);
+    res.status(200).send(csv);
   } catch {
-    return toError(res, 500, "Server failure");
+    toError(res, 500, "Server failure");
+  }
+});
+
+app.delete("/api/profiles/:id", authorizeRoles("admin"), async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query("DELETE FROM profiles WHERE id = $1", [req.params.id]);
+    if (result.rowCount === 0) {
+      toError(res, 404, "Profile not found");
+      return;
+    }
+    res.status(204).send();
+  } catch {
+    toError(res, 500, "Server failure");
   }
 });
 
 const startServer = async (): Promise<void> => {
-  await getDb();
+  await initializeDatabase();
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });

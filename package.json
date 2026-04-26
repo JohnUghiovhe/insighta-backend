@@ -14,13 +14,14 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "dotenv": "^17.2.3",
     "express": "^5.2.1",
-    "sqlite": "^5.1.1",
-    "sqlite3": "^6.0.1"
+    "pg": "^8.16.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
+    "@types/pg": "^8.15.6",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   }
