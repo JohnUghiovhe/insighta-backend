@@ -1,32 +1,44 @@
 import { NextFunction, Request, Response } from "express";
-import { RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS } from "../config";
+import { AUTH_RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS, USER_RATE_LIMIT_MAX_REQUESTS } from "../config";
 import { toError } from "../utils/http";
 
-const rateStore = new Map<string, { count: number; windowStart: number }>();
+type RateEntry = { count: number; windowStart: number };
 
-export const rateLimit = (req: Request, res: Response, next: NextFunction): void => {
-  const ip = req.ip || req.socket.remoteAddress || "unknown";
-  const now = Date.now();
-  const current = rateStore.get(ip);
+const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => string) => {
+  const rateStore = new Map<string, RateEntry>();
 
-  if (!current || now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
-    rateStore.set(ip, { count: 1, windowStart: now });
-  } else {
-    current.count += 1;
-    if (current.count > RATE_LIMIT_MAX_REQUESTS) {
-      toError(res, 429, "Too many requests");
-      return;
-    }
-  }
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const key = keyResolver(req);
+    const now = Date.now();
+    const current = rateStore.get(key);
 
-  if (rateStore.size > 10_000) {
-    const cutoff = now - RATE_LIMIT_WINDOW_MS;
-    for (const [key, value] of rateStore.entries()) {
-      if (value.windowStart < cutoff) {
-        rateStore.delete(key);
+    if (!current || now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
+      rateStore.set(key, { count: 1, windowStart: now });
+    } else {
+      current.count += 1;
+      if (current.count > maxRequests) {
+        toError(res, 429, "Too many requests");
+        return;
       }
     }
-  }
 
-  next();
+    if (rateStore.size > 10_000) {
+      const cutoff = now - RATE_LIMIT_WINDOW_MS;
+      for (const [storedKey, value] of rateStore.entries()) {
+        if (value.windowStart < cutoff) {
+          rateStore.delete(storedKey);
+        }
+      }
+    }
+
+    next();
+  };
 };
+
+const resolveIpKey = (req: Request): string => req.ip || req.socket.remoteAddress || "unknown";
+
+const resolveUserKey = (req: Request): string => req.authUser?.id ?? resolveIpKey(req);
+
+export const authRateLimit = createRateLimit(AUTH_RATE_LIMIT_MAX_REQUESTS, resolveIpKey);
+
+export const userRateLimit = createRateLimit(USER_RATE_LIMIT_MAX_REQUESTS, resolveUserKey);
