@@ -193,7 +193,7 @@ const sendAuthSuccess = (res: Response, result: { user: Record<string, unknown>;
   });
 };
 
-export const githubLogin = async (_req: Request, res: Response): Promise<void> => {
+export const githubLogin = async (req: Request, res: Response): Promise<void> => {
   const oauthConfig = getBrowserGithubOauthConfig();
 
   if (!oauthConfig) {
@@ -201,19 +201,32 @@ export const githubLogin = async (_req: Request, res: Response): Promise<void> =
     return;
   }
 
+  // Allow frontend to override redirect_uri via query parameter
+  let redirectUri = oauthConfig.redirectUri;
+  const callbackUrl = req.query.callback_url as string | undefined;
+  if (callbackUrl) {
+    try {
+      // Validate the callback URL to prevent open redirect attacks
+      const callbackUrlObj = new URL(callbackUrl);
+      redirectUri = callbackUrl;
+    } catch {
+      // Invalid URL, use default
+    }
+  }
+
   const state = createOpaqueToken();
   const codeVerifier = createOpaqueToken();
   const codeChallenge = createPkceChallenge(codeVerifier);
 
   await pool.query(
-    `INSERT INTO oauth_pkce_states (state, code_verifier, expires_at)
-     VALUES ($1, $2, NOW() + INTERVAL '10 minutes')`,
-    [state, codeVerifier]
+    `INSERT INTO oauth_pkce_states (state, code_verifier, expires_at, redirect_uri)
+     VALUES ($1, $2, NOW() + INTERVAL '10 minutes', $3)`,
+    [state, codeVerifier, redirectUri]
   );
 
   const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
   authorizeUrl.searchParams.set("client_id", oauthConfig.clientId);
-  authorizeUrl.searchParams.set("redirect_uri", oauthConfig.redirectUri);
+  authorizeUrl.searchParams.set("redirect_uri", redirectUri);
   authorizeUrl.searchParams.set("scope", getGithubScope());
   authorizeUrl.searchParams.set("state", state);
   authorizeUrl.searchParams.set("code_challenge", codeChallenge);
@@ -260,7 +273,7 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
   try {
     const result = await withTransaction(async (client) => {
       const pkceResult = await client.query(
-        `SELECT code_verifier
+        `SELECT code_verifier, redirect_uri
          FROM oauth_pkce_states
          WHERE state = $1 AND expires_at > NOW()
          LIMIT 1`,
@@ -274,11 +287,14 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
 
       await client.query("DELETE FROM oauth_pkce_states WHERE state = $1", [state]);
 
+      // Use stored redirect_uri or fallback to configured one
+      const redirectUri = pkceState.redirect_uri || oauthConfig.redirectUri;
+
       const githubAccessToken = await exchangeGithubCode(
         oauthConfig.clientId,
         oauthConfig.clientSecret,
         code,
-        oauthConfig.redirectUri,
+        redirectUri,
         String(pkceState.code_verifier)
       );
       return upsertUserAndIssueTokens(githubAccessToken);

@@ -63,8 +63,15 @@ export const initializeDatabase = async (): Promise<void> => {
     CREATE TABLE IF NOT EXISTS oauth_pkce_states (
       state VARCHAR(255) PRIMARY KEY,
       code_verifier TEXT NOT NULL,
+      redirect_uri TEXT,
       expires_at TIMESTAMPTZ NOT NULL
     );
+  `);
+
+  // Add redirect_uri column if it doesn't exist (migration for existing databases)
+  await pool.query(`
+    ALTER TABLE oauth_pkce_states
+    ADD COLUMN IF NOT EXISTS redirect_uri TEXT;
   `);
 
   await pool.query(`
