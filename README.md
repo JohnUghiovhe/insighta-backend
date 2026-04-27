@@ -1,210 +1,198 @@
-# Insighta Labs+
+# Insighta Labs+ Backend
 
 Insighta Labs+ is a TypeScript + Express backend for profile intelligence with:
-- GitHub OAuth (PKCE)
+
+- GitHub OAuth with PKCE support for browser and CLI flows
 - role-based API access (`admin`, `analyst`)
-- opaque access/refresh tokens with server-side hashing
+- opaque access/refresh tokens stored as hashes
 - deterministic natural-language profile search
 - structured request logging
 - route-scoped rate limiting
 
----
+## Project Links
+
+Use this table to jump between full docs across repos.
+
+| Project | Purpose | Docs |
+| --- | --- | --- |
+| Insighta+ Labs Backend (this repo) | Auth, profile APIs, parser, RBAC, rate limits | This README |
+| Insighta CLI | Terminal client for auth/profile workflows | [CLI README](https://github.com/JohnUghiovhe/Insighta-CLI#readme) |
+| Insighta Web Frontend | Browser-based experience for the same APIs | [Frontend README](https://github.com/JohnUghiovhe/insighta-web#readme) |
+
+## Live URLs
+
+| Surface | URL | Status |
+| --- | --- | --- |
+| Frontend | Pending deployment URL | To be updated |
+| Backend Base | https://intelligence-query-engine-production.up.railway.app/ | Live |
+| Backend Health | https://intelligence-query-engine-production.up.railway.app/health | Live |
+
+## What Was Updated
+
+This README now reflects the current implementation:
+
+- documents CLI OAuth handshake endpoints (`/auth/github/init` and `/auth/github/exchange`)
+- includes protected `GET /auth/me`
+- clarifies parser behavior and examples used by `insighta profiles search`
+- captures list pagination behavior, including cursor mode for `created_at`
+- adds cross-repo docs table and frontend placeholder
 
 ## System Architecture
 
-### Runtime Structure
+| Layer | Key Files | Responsibilities |
+| --- | --- | --- |
+| Bootstrap | `src/server.ts` | Loads env, initializes DB, starts Express |
+| App Wiring | `src/app.ts` | JSON parsing, logger, CORS, routing/middleware chain |
+| Auth Controller | `src/controllers/authController.ts` | OAuth flows, token issue/refresh/logout, me endpoint |
+| Profile Controller | `src/controllers/profileController.ts` | CRUD, filters, pagination, export, NL parser search |
+| Middleware | `src/middleware/*` | request logging, auth, RBAC, API version, rate limits |
+| Data Layer | `src/db.ts` | Postgres connection, schema bootstrap and seed handling |
 
-- **Bootstrap**: `src/server.ts`
-  - loads environment (`dotenv/config`)
-  - initializes schema + seed state (`initializeDatabase()`)
-  - starts Express app (`createApp()`)
-
-- **App wiring**: `src/app.ts`
-  - JSON body parsing
-  - global request logger
-  - CORS/OPTIONS handling
-  - route-scoped throttling
-  - auth/authorization middleware chain
-
-- **Controllers**:
-  - `src/controllers/authController.ts` (OAuth + token lifecycle)
-  - `src/controllers/profileController.ts` (CRUD, filter/sort/paginate, export, NL query)
-
-- **Middleware**:
-  - `requestLogger` (`src/middleware/requestLogger.ts`)
-  - `authRateLimit` and `userRateLimit` (`src/middleware/rateLimit.ts`)
-  - `authenticateAccessToken` + `authorizeRoles` (`src/middleware/auth.ts`)
-  - `requireApiVersion` (`src/middleware/apiVersion.ts`)
-
-- **Data layer**:
-  - PostgreSQL via `pg` (`src/db.ts`)
-  - schema bootstrapped at startup
-  - seed ingestion from `seed_profiles.json` when needed
-
-### Request Pipeline (Current)
+### Request Pipeline
 
 1. `express.json()`
-2. `requestLogger` (captures finish events for every response, including 429s)
-3. CORS handler (`OPTIONS -> 204`)
-4. Routes:
-   - `GET /health` -> `userRateLimit`
-   - `/auth/*` -> `authRateLimit`
-   - `/api/*` -> `authenticateAccessToken` -> `userRateLimit`
-   - `/api/profiles/*` -> `requireApiVersion` + RBAC route guards
-
----
+2. request logger captures completed responses
+3. CORS and `OPTIONS` handling
+4. route scopes:
+   - `/health` -> user limiter
+   - `/auth/*` -> auth limiter
+   - `/api/*` -> bearer auth + user limiter
+   - `/api/profiles/*` -> API version header + RBAC checks
 
 ## Authentication Flow
 
-### 1) Start OAuth
-`GET /auth/github`
+### Browser OAuth
 
-- validates GitHub env config
-- creates:
-  - random `state`
-  - PKCE `code_verifier`
-  - PKCE `code_challenge`
-- stores state/verifier with expiration in `oauth_pkce_states`
-- redirects user to GitHub authorization URL
+1. `GET /auth/github` creates PKCE state+verifier and redirects to GitHub.
+2. `GET /auth/github/callback` validates callback state, exchanges code, upserts user, and returns token pair.
 
-### 2) OAuth callback
-`GET /auth/github/callback?code=...&state=...`
+### CLI OAuth
 
-- validates query parameters
-- verifies unexpired PKCE state (and consumes it)
-- exchanges code with GitHub for access token
-- fetches GitHub user profile (+ fallback email lookup)
-- upserts local user by `github_id`
-- issues app access + refresh token pair
+1. CLI requests `GET /auth/github/init` to fetch client metadata.
+2. CLI opens GitHub authorize URL with its own local callback URL and PKCE values.
+3. CLI sends `POST /auth/github/exchange` with:
+   - `code`
+   - `code_verifier`
+   - `redirect_uri`
+4. Backend exchanges code and returns token pair plus user payload.
 
-### 3) Access protected APIs
-Use:
+### Session Endpoints
 
-`Authorization: Bearer <access_token>`
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/auth/me` | `GET` | Returns authenticated user profile |
+| `/auth/refresh` | `POST` | Rotates refresh token and returns new pair |
+| `/auth/logout` | `POST` | Revokes refresh token |
 
-for `/api/*` endpoints.
+## CLI Usage
 
-### 4) Refresh session
-`POST /auth/refresh`
+The backend is consumed directly by the CLI repo.
 
-```json
-{ "refresh_token": "..." }
+```bash
+insighta login
+insighta whoami
+insighta profiles list --limit 3
+insighta profiles search "young males from nigeria"
+insighta profiles export --format csv
 ```
 
-- validates refresh token (exists, unrevoked, unexpired)
-- rejects inactive users
-- issues new access + refresh pair
-- revokes old refresh token and stores replacement hash
-
-### 5) Logout
-`POST /auth/logout`
-
-```json
-{ "refresh_token": "..." }
-```
-
-- revokes refresh token server-side
-
----
+CLI repository: https://github.com/JohnUghiovhe/Insighta-CLI
 
 ## Token Handling Approach
 
-- Access and refresh tokens are opaque random strings.
-- Raw tokens are never stored in DB.
-- Tokens are SHA-256 hashed before persistence.
-- Defaults from `src/config.ts`:
-  - access token TTL: `3 minutes`
-  - refresh token TTL: `5 minutes`
-  - PKCE state TTL: `10 minutes`
-- Refresh rotation is single-use: successful refresh revokes the previous refresh token immediately.
-
----
+- access and refresh tokens are opaque random strings
+- raw tokens are never persisted
+- SHA-256 token hashes are stored in DB
+- default TTLs:
+  - access token: 3 minutes
+  - refresh token: 5 minutes
+  - PKCE state: 10 minutes
+- refresh token rotation is single-use and revokes previous token immediately
 
 ## Role Enforcement Logic
 
-### Identity enforcement
-
-- All `/api/*` routes require valid bearer token via `authenticateAccessToken`.
-- Inactive users are blocked with `403`.
-
-### Role checks
-
-`authorizeRoles(...)` is applied per route in `src/routes/profileRoutes.ts`.
-
-- **admin + analyst**
-  - `GET /api/profiles`
-  - `GET /api/profiles/:id`
-  - `GET /api/profiles/search`
-  - `GET /api/profiles/export`
-
-- **admin only**
-  - `POST /api/profiles`
-  - `DELETE /api/profiles/:id`
-
-### Version gate
+All `/api/*` routes require bearer authentication. Inactive users are denied.
 
 All `/api/profiles/*` routes require:
 
-`X-API-Version: 1`
+- `Authorization: Bearer <access_token>`
+- `X-API-Version: 1`
 
-Otherwise: `400 API version header required`.
+Role access:
 
----
+| Route | Analyst | Admin |
+| --- | --- | --- |
+| `GET /api/profiles` | Yes | Yes |
+| `GET /api/profiles/:id` | Yes | Yes |
+| `GET /api/profiles/search` | Yes | Yes |
+| `GET /api/profiles/export` | Yes | Yes |
+| `POST /api/profiles` | No | Yes |
+| `DELETE /api/profiles/:id` | No | Yes |
 
 ## Natural Language Parsing Approach
 
-Natural-language search is deterministic and rule-based (non-LLM), implemented in
-`parseNaturalLanguageQuery()` inside `src/controllers/profileController.ts`.
+Natural-language search is deterministic and rule-based (non-LLM), implemented in the profile controller.
 
-Pipeline:
+`GET /api/profiles/search?q=<text>` supports:
 
-1. normalize query (lowercase, trim, collapse spaces)
-2. infer gender keywords:
-   - male/man/men
-   - female/woman/women
-3. infer age-group keywords:
-   - child, teenager, adult, senior/elderly
-4. map `"young"` to fixed age range `16..24`
-5. infer numeric age bounds:
-   - `above|over|older than|greater than <n>` -> `min_age`
-   - `below|under|younger than|less than <n>` -> `max_age`
-6. resolve `from <country>` to `country_id` by querying existing `profiles.country_name`
-7. reject if:
-   - no interpretable filters
-   - conflicting bounds (`min_age > max_age`)
-   - unknown country reference
+- gender terms: male/man/men and female/woman/women
+- age group terms: child, teenager, adult, senior, elderly
+- young shortcut: fixed range `16..24`
+- numeric bounds:
+  - above, over, older than, greater than `<n>` -> `min_age`
+  - below, under, younger than, less than `<n>` -> `max_age`
+- country extraction from `from <country>` with lookup against existing `profiles.country_name`
 
-When parsing fails: `400 Unable to interpret query`.
+Parser failure cases return `400 Unable to interpret query`:
 
----
+- no recognized filters
+- conflicting bounds (`min_age > max_age`)
+- unknown country text
+
+### Parser Examples (Used By CLI Search)
+
+| Query Text | Parsed Meaning |
+| --- | --- |
+| `young males from nigeria` | male, age 16-24, country NG |
+| `women above 30` | female, min_age 30 |
+| `teenage men from kenya` | male, age_group teenager, country KE |
+| `seniors under 70` | age_group senior, max_age 70 |
+| `adults from canada` | age_group adult, country CA |
+
+## Profiles API Details
+
+### List Profiles
+
+`GET /api/profiles`
+
+Supported query params include:
+
+- filters: `gender`, `age_group`, `country_id`, `min_age`, `max_age`, `min_gender_probability`, `min_country_probability`
+- sort: `sort_by` (`age`, `created_at`, `gender_probability`), `order` (`asc`, `desc`)
+- pagination:
+  - page mode: `page`, `limit`
+  - cursor mode: `cursor`, `limit` (only when `sort_by=created_at` and no `page`)
+
+### Export Profiles
+
+`GET /api/profiles/export?format=csv` returns CSV with the same filter/sort semantics.
+
+### Search Profiles
+
+`GET /api/profiles/search?q=...` supports natural-language parser + page pagination (`page`, `limit`).
 
 ## Rate Limiting
 
-Window: `60s` in-memory counter.
+Window is 60 seconds (in-memory counters):
 
-- `/auth/*`:
-  - **10 requests/minute** (IP-scoped)
-- all other API surface:
-  - **60 requests/minute per user**
-  - keyed by authenticated `authUser.id`
-  - fallback to IP when user id is unavailable (e.g. `/health`)
+- `/auth/*`: 10 requests/minute per IP
+- authenticated API: 60 requests/minute per user (fallback to IP if user id missing)
 
-Exceeded requests return:
-
-- `429 Too many requests`
-
-Config keys (`src/config.ts`):
-
-```env
-AUTH_RATE_LIMIT_MAX_REQUESTS=10
-USER_RATE_LIMIT_MAX_REQUESTS=60
-```
-
----
+Exceeded limit returns `429 Too many requests`.
 
 ## Request Logging
 
-`requestLogger` logs one structured JSON event per completed response:
+Each completed response logs a structured JSON object with:
 
 - `timestamp`
 - `method`
@@ -214,89 +202,13 @@ USER_RATE_LIMIT_MAX_REQUESTS=60
 - `user_id` (or `null`)
 - `ip`
 
-Because logger is mounted before route handlers, throttled responses (`429`) are logged too.
-
----
-
 ## API Surface
 
-### Health
-
-- `GET /health`
-
-### Auth
-
-- `GET /auth/github`
-- `GET /auth/github/callback`
-- `POST /auth/refresh`
-- `POST /auth/logout`
-
-### Profiles (all require bearer auth + `X-API-Version: 1`)
-
-- `GET /api/profiles`
-- `GET /api/profiles/:id`
-- `GET /api/profiles/search?q=...`
-- `GET /api/profiles/export?format=csv`
-- `POST /api/profiles`
-- `DELETE /api/profiles/:id`
-
----
-
-## CLI Usage
-
-The CLI is expected to be installed globally and usable from any directory.
-
-```bash
-npm install -g insighta-cli
-```
-
-After global installation, this must work from any path:
-
-```bash
-insighta login
-```
-
-### Authentication Commands
-
-```bash
-insighta login
-insighta logout
-insighta whoami
-```
-
-### Profile Commands
-
-```bash
-insighta profiles list
-insighta profiles list --gender male
-insighta profiles list --country NG --age-group adult
-insighta profiles list --min-age 25 --max-age 40
-insighta profiles list --sort-by age --order desc
-insighta profiles list --page 2 --limit 20
-
-insighta profiles get <id>
-
-insighta profiles search "young males from nigeria"
-
-insighta profiles create --name "Harriet Tubman"
-
-insighta profiles export --format csv
-insighta profiles export --format csv --gender male --country NG
-```
-
-### CLI Runtime Expectations
-
-- Uses auth tokens on every API request.
-- Stores credentials at `~/.insighta/credentials.json`.
-- Handles access-token expiry:
-  - auto-refreshes when refresh token is still valid
-  - prompts user to re-login when refresh is not possible
-- Shows a loader during network operations.
-- Displays fetched results in a structured table.
-- Provides clear operation feedback and error messages.
-- Saves exported CSV files to the current working directory.
-
----
+| Area | Endpoints |
+| --- | --- |
+| Health | `GET /health` |
+| Auth | `GET /auth/github`, `GET /auth/github/init`, `GET /auth/github/callback`, `POST /auth/github/exchange`, `GET /auth/me`, `POST /auth/refresh`, `POST /auth/logout` |
+| Profiles | `GET /api/profiles`, `GET /api/profiles/:id`, `GET /api/profiles/search`, `GET /api/profiles/export`, `POST /api/profiles`, `DELETE /api/profiles/:id` |
 
 ## Environment Variables
 
@@ -313,17 +225,14 @@ AUTH_RATE_LIMIT_MAX_REQUESTS=10
 USER_RATE_LIMIT_MAX_REQUESTS=60
 ```
 
----
-
 ## Data Model (Core Tables)
 
-- `profiles`
-  - demographic profile intelligence records
-- `users`
-  - GitHub-linked application users + role + active state
-- `oauth_pkce_states`
-  - transient state/verifier for OAuth PKCE
-- `access_tokens`
-  - hashed short-lived access tokens
-- `refresh_tokens`
-  - hashed refresh tokens, revocation + replacement metadata
+- `profiles`: demographic profile intelligence records
+- `users`: GitHub-linked users, role, active state
+- `oauth_pkce_states`: transient PKCE state + verifier records
+- `access_tokens`: hashed short-lived access tokens
+- `refresh_tokens`: hashed refresh tokens with revocation and replacement metadata
+
+## Frontend Placeholder
+
+This README reserves deployment details for the frontend once a live URL is available.
