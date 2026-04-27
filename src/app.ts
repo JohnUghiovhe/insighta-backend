@@ -21,12 +21,15 @@ export const createApp = () => {
     next();
   });
 
-  app.get("/health", userRateLimit, (_req, res) => {
+  app.use("/auth", authRateLimit, authRoutes);
+
+  app.use("/api", authenticateAccessToken);
+  app.use(userRateLimit);
+
+  app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" });
   });
 
-  app.use("/auth", authRateLimit, authRoutes);
-  app.use("/api", authenticateAccessToken, userRateLimit);
   app.use("/api/profiles", profileRoutes);
 
   return app;

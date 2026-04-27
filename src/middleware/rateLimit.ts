@@ -17,7 +17,9 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
     } else {
       current.count += 1;
       if (current.count > maxRequests) {
-        toError(res, 429, "Too many requests");
+        const retryAfterSeconds = Math.max(1, Math.ceil((RATE_LIMIT_WINDOW_MS - (now - current.windowStart)) / 1000));
+        res.setHeader("Retry-After", String(retryAfterSeconds));
+        toError(res, 429, "Too Many Requests");
         return;
       }
     }
