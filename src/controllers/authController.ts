@@ -5,6 +5,44 @@ import { createOpaqueToken, createPkceChallenge, generateUuidV7, hashToken } fro
 import { toError } from "../utils/http";
 import { Role } from "../types";
 
+const getGithubScope = (): string => process.env.GITHUB_SCOPE || "read:user user:email";
+
+const getBrowserGithubOauthConfig = (): {
+  clientId: string;
+  clientSecret: string;
+  redirectUri: string;
+} | null => {
+  const clientId = process.env.GITHUB_BROWSER_CLIENT_ID || process.env.GITHUB_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_BROWSER_CLIENT_SECRET || process.env.GITHUB_CLIENT_SECRET;
+  const redirectUri = process.env.GITHUB_BROWSER_REDIRECT_URI || process.env.GITHUB_REDIRECT_URI;
+
+  if (!clientId || !clientSecret || !redirectUri) {
+    return null;
+  }
+
+  return { clientId, clientSecret, redirectUri };
+};
+
+const getCliGithubOauthConfig = (): {
+  clientId: string;
+  clientSecret: string;
+  allowedRedirectUri?: string;
+} | null => {
+  const clientId = process.env.GITHUB_CLI_CLIENT_ID || process.env.GITHUB_CLIENT_ID;
+  const clientSecret = process.env.GITHUB_CLI_CLIENT_SECRET || process.env.GITHUB_CLIENT_SECRET;
+  const allowedRedirectUri = process.env.GITHUB_CLI_REDIRECT_URI?.trim();
+
+  if (!clientId || !clientSecret) {
+    return null;
+  }
+
+  return {
+    clientId,
+    clientSecret,
+    allowedRedirectUri: allowedRedirectUri || undefined
+  };
+};
+
 const toIso = (value: unknown): string => {
   if (value instanceof Date) {
     return value.toISOString();
@@ -156,10 +194,9 @@ const sendAuthSuccess = (res: Response, result: { user: Record<string, unknown>;
 };
 
 export const githubLogin = async (_req: Request, res: Response): Promise<void> => {
-  const githubClientId = process.env.GITHUB_CLIENT_ID;
-  const githubRedirectUri = process.env.GITHUB_REDIRECT_URI;
+  const oauthConfig = getBrowserGithubOauthConfig();
 
-  if (!githubClientId || !githubRedirectUri) {
+  if (!oauthConfig) {
     toError(res, 500, "GitHub OAuth is not configured");
     return;
   }
@@ -175,9 +212,9 @@ export const githubLogin = async (_req: Request, res: Response): Promise<void> =
   );
 
   const authorizeUrl = new URL("https://github.com/login/oauth/authorize");
-  authorizeUrl.searchParams.set("client_id", githubClientId);
-  authorizeUrl.searchParams.set("redirect_uri", githubRedirectUri);
-  authorizeUrl.searchParams.set("scope", process.env.GITHUB_SCOPE || "read:user user:email");
+  authorizeUrl.searchParams.set("client_id", oauthConfig.clientId);
+  authorizeUrl.searchParams.set("redirect_uri", oauthConfig.redirectUri);
+  authorizeUrl.searchParams.set("scope", getGithubScope());
   authorizeUrl.searchParams.set("state", state);
   authorizeUrl.searchParams.set("code_challenge", codeChallenge);
   authorizeUrl.searchParams.set("code_challenge_method", "S256");
@@ -186,25 +223,23 @@ export const githubLogin = async (_req: Request, res: Response): Promise<void> =
 };
 
 export const githubLoginInit = async (_req: Request, res: Response): Promise<void> => {
-  const githubClientId = process.env.GITHUB_CLIENT_ID;
-  if (!githubClientId) {
+  const oauthConfig = getCliGithubOauthConfig();
+  if (!oauthConfig) {
     toError(res, 500, "GitHub OAuth is not configured");
     return;
   }
 
   res.status(200).json({
     status: "success",
-    client_id: githubClientId,
-    scope: process.env.GITHUB_SCOPE || "read:user user:email"
+    client_id: oauthConfig.clientId,
+    scope: getGithubScope()
   });
 };
 
 export const githubCallback = async (req: Request, res: Response): Promise<void> => {
-  const githubClientId = process.env.GITHUB_CLIENT_ID;
-  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
-  const githubRedirectUri = process.env.GITHUB_REDIRECT_URI;
+  const oauthConfig = getBrowserGithubOauthConfig();
 
-  if (!githubClientId || !githubClientSecret || !githubRedirectUri) {
+  if (!oauthConfig) {
     toError(res, 500, "GitHub OAuth is not configured");
     return;
   }
@@ -240,10 +275,10 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
       await client.query("DELETE FROM oauth_pkce_states WHERE state = $1", [state]);
 
       const githubAccessToken = await exchangeGithubCode(
-        githubClientId,
-        githubClientSecret,
+        oauthConfig.clientId,
+        oauthConfig.clientSecret,
         code,
-        githubRedirectUri,
+        oauthConfig.redirectUri,
         String(pkceState.code_verifier)
       );
       return upsertUserAndIssueTokens(githubAccessToken);
@@ -268,9 +303,8 @@ export const githubCallback = async (req: Request, res: Response): Promise<void>
 };
 
 export const githubCliExchange = async (req: Request, res: Response): Promise<void> => {
-  const githubClientId = process.env.GITHUB_CLIENT_ID;
-  const githubClientSecret = process.env.GITHUB_CLIENT_SECRET;
-  if (!githubClientId || !githubClientSecret) {
+  const oauthConfig = getCliGithubOauthConfig();
+  if (!oauthConfig) {
     toError(res, 500, "GitHub OAuth is not configured");
     return;
   }
@@ -283,8 +317,19 @@ export const githubCliExchange = async (req: Request, res: Response): Promise<vo
     return;
   }
 
+  if (oauthConfig.allowedRedirectUri && redirectUri !== oauthConfig.allowedRedirectUri) {
+    toError(res, 400, "redirect_uri is not allowed");
+    return;
+  }
+
   try {
-    const githubAccessToken = await exchangeGithubCode(githubClientId, githubClientSecret, code, redirectUri, codeVerifier);
+    const githubAccessToken = await exchangeGithubCode(
+      oauthConfig.clientId,
+      oauthConfig.clientSecret,
+      code,
+      redirectUri,
+      codeVerifier
+    );
     const result = await upsertUserAndIssueTokens(githubAccessToken);
     sendAuthSuccess(res, result);
   } catch (error) {

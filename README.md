@@ -63,10 +63,14 @@ This README now reflects the current implementation:
 
 ### Browser OAuth
 
+Uses browser OAuth app env values (`GITHUB_BROWSER_*`) with fallback to legacy `GITHUB_*` values.
+
 1. `GET /auth/github` creates PKCE state+verifier and redirects to GitHub.
 2. `GET /auth/github/callback` validates callback state, exchanges code, upserts user, and returns token pair.
 
 ### CLI OAuth
+
+Uses CLI OAuth app env values (`GITHUB_CLI_*`) with fallback to legacy `GITHUB_*` values.
 
 1. CLI requests `GET /auth/github/init` to fetch client metadata.
 2. CLI opens GitHub authorize URL with its own local callback URL and PKCE values.
@@ -75,6 +79,8 @@ This README now reflects the current implementation:
    - `code_verifier`
    - `redirect_uri`
 4. Backend exchanges code and returns token pair plus user payload.
+
+If `GITHUB_CLI_REDIRECT_URI` is set, backend enforces an exact match for `redirect_uri` in CLI exchange.
 
 ### Session Endpoints
 
@@ -215,9 +221,22 @@ Each completed response logs a structured JSON object with:
 ```env
 PORT=3021
 DATABASE_URL=postgresql://...
+
+# Browser OAuth app (recommended for /auth/github and /auth/github/callback)
+GITHUB_BROWSER_CLIENT_ID=...
+GITHUB_BROWSER_CLIENT_SECRET=...
+GITHUB_BROWSER_REDIRECT_URI=http://localhost:3021/auth/github/callback
+
+# CLI OAuth app (recommended for /auth/github/init and /auth/github/exchange)
+GITHUB_CLI_CLIENT_ID=...
+GITHUB_CLI_CLIENT_SECRET=...
+GITHUB_CLI_REDIRECT_URI=http://localhost:8787/callback
+
+# Backward-compatible legacy fallback variables
 GITHUB_CLIENT_ID=...
 GITHUB_CLIENT_SECRET=...
 GITHUB_REDIRECT_URI=http://localhost:3021/auth/github/callback
+
 GITHUB_SCOPE=read:user user:email
 
 # Optional overrides
