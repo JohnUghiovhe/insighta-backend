@@ -242,10 +242,10 @@ Each completed response logs a structured JSON object with:
 PORT=3021
 DATABASE_URL=postgresql://...
 
-# Browser OAuth app (recommended for /auth/github and /auth/github/callback)
+# Browser OAuth app (recommended for production web sign-in)
 GITHUB_BROWSER_CLIENT_ID=...
 GITHUB_BROWSER_CLIENT_SECRET=...
-GITHUB_BROWSER_REDIRECT_URI=http://localhost:3021/auth/github/callback
+GITHUB_BROWSER_REDIRECT_URI=https://insighta-web-pied.vercel.app/api/auth/callback
 
 # CLI OAuth app (recommended for /auth/github/init and /auth/github/exchange)
 GITHUB_CLI_CLIENT_ID=...
@@ -255,7 +255,7 @@ GITHUB_CLI_REDIRECT_URI=http://localhost:8787/callback
 # Backward-compatible legacy fallback variables
 GITHUB_CLIENT_ID=...
 GITHUB_CLIENT_SECRET=...
-GITHUB_REDIRECT_URI=http://localhost:3021/auth/github/callback
+GITHUB_REDIRECT_URI=https://insighta-web-pied.vercel.app/api/auth/callback
 
 GITHUB_SCOPE=read:user user:email
 
