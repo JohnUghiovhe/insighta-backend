@@ -23,9 +23,29 @@ Use this table to jump between full docs across repos.
 
 | Surface | URL | Status |
 | --- | --- | --- |
-| Frontend | Pending deployment URL | To be updated |
+| Frontend | https://insighta-web-pied.vercel.app/ | Live |
 | Backend Base | https://intelligence-query-engine-production.up.railway.app/ | Live |
 | Backend Health | https://intelligence-query-engine-production.up.railway.app/health | Live |
+
+## System Expectations
+
+The backend is the shared source of truth for the entire Insighta platform.
+
+- CLI and Web both authenticate against the same backend user and token model.
+- Profile data, search results, and authorization decisions must stay consistent across interfaces.
+- Authentication is enforced globally on protected routes rather than being trusted at the client layer.
+- Access control must remain predictable so the same role always receives the same API outcome.
+
+## Key Engineering Challenges
+
+These are the cross-interface concerns this backend is designed to handle:
+
+- OAuth with PKCE across both CLI and browser flows
+- coordination between CLI, browser, and backend callback/exchange steps
+- token lifecycle management for access and refresh tokens
+- role-based authorization design for admin and analyst paths
+- multi-interface consistency for search, profiles, and account state
+- failure handling for expired tokens, failed auth exchanges, and callback timeouts
 
 ## What Was Updated
 
@@ -254,4 +274,18 @@ USER_RATE_LIMIT_MAX_REQUESTS=60
 
 ## Frontend Placeholder
 
-This README reserves deployment details for the frontend once a live URL is available.
+The frontend is the browser-facing client for the same backend APIs used by the CLI.
+
+### Frontend Links
+
+| Item | URL |
+| --- | --- |
+| Frontend Repo | https://github.com/JohnUghiovhe/insighta-web |
+| Frontend Live App | https://insighta-web-pied.vercel.app/ |
+
+### Frontend Responsibilities
+
+- render the browser login, dashboard, profiles, search, and account views
+- rely on backend sessions and API responses rather than local client-side auth state
+- keep UI authorization aligned with backend role checks
+- surface the same live profile intelligence that the CLI exposes in terminal workflows
