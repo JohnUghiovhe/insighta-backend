@@ -67,16 +67,19 @@ const issueTokenPair = async (client: { query: (text: string, params?: unknown[]
   const accessTokenHash = hashToken(accessToken);
   const refreshTokenHash = hashToken(refreshToken);
 
+  const accessExpiresAt = new Date(Date.now() + ACCESS_TOKEN_TTL_MS).toISOString();
+  const refreshExpiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS).toISOString();
+
   await client.query(
     `INSERT INTO access_tokens (id, user_id, token_hash, expires_at)
-     VALUES ($1, $2, $3, NOW() + INTERVAL '3 minutes')`,
-    [generateUuidV7(), userId, accessTokenHash]
+     VALUES ($1, $2, $3, $4)`,
+    [generateUuidV7(), userId, accessTokenHash, accessExpiresAt]
   );
 
   await client.query(
     `INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at)
-     VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes')`,
-    [generateUuidV7(), userId, refreshTokenHash]
+     VALUES ($1, $2, $3, $4)`,
+    [generateUuidV7(), userId, refreshTokenHash, refreshExpiresAt]
   );
 
   return {

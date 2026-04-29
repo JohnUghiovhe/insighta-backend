@@ -35,7 +35,9 @@ export const authenticateAccessToken = async (req: Request, res: Response, next:
         u.email,
         u.avatar_url,
         u.role,
-        u.is_active
+        u.is_active,
+        u.last_login_at,
+        u.created_at
        FROM access_tokens at
        JOIN users u ON u.id = at.user_id
        WHERE at.token_hash = $1

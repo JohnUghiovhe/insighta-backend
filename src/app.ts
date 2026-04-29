@@ -1,4 +1,5 @@
 import express from "express";
+import { pool } from "./db";
 import { authenticateAccessToken } from "./middleware/auth";
 import { authRateLimit, userRateLimit } from "./middleware/rateLimit";
 import { requestLogger } from "./middleware/requestLogger";
@@ -31,6 +32,27 @@ export const createApp = () => {
 
   app.get("/health", (_req, res) => {
     res.status(200).json({ status: "ok" });
+  });
+
+  app.get("/health/meta", async (_req, res) => {
+    try {
+      const [profileCount, userCount, activeUserCount] = await Promise.all([
+        pool.query("SELECT COUNT(*)::int AS total FROM profiles"),
+        pool.query("SELECT COUNT(*)::int AS total FROM users"),
+        pool.query("SELECT COUNT(*)::int AS total FROM users WHERE is_active = TRUE")
+      ]);
+
+      res.status(200).json({
+        status: "ok",
+        data: {
+          profiles: Number(profileCount.rows[0]?.total ?? 0),
+          users: Number(userCount.rows[0]?.total ?? 0),
+          active_users: Number(activeUserCount.rows[0]?.total ?? 0)
+        }
+      });
+    } catch {
+      res.status(500).json({ status: "error" });
+    }
   });
 
   app.use("/api/profiles", profileRoutes);

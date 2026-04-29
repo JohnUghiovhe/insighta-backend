@@ -18,7 +18,11 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
       current.count += 1;
       if (current.count > maxRequests) {
         const retryAfterSeconds = Math.max(1, Math.ceil((RATE_LIMIT_WINDOW_MS - (now - current.windowStart)) / 1000));
+        const resetAt = Math.floor((current.windowStart + RATE_LIMIT_WINDOW_MS) / 1000);
         res.setHeader("Retry-After", String(retryAfterSeconds));
+        res.setHeader("X-RateLimit-Limit", String(maxRequests));
+        res.setHeader("X-RateLimit-Remaining", "0");
+        res.setHeader("X-RateLimit-Reset", String(resetAt));
         toError(res, 429, "Too Many Requests");
         return;
       }
@@ -33,6 +37,13 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
       }
     }
 
+    // Set standard rate limit headers for successful requests
+    const entry = rateStore.get(key)!;
+    const resetAt = Math.floor((entry.windowStart + RATE_LIMIT_WINDOW_MS) / 1000);
+    const remaining = Math.max(0, maxRequests - entry.count);
+    res.setHeader("X-RateLimit-Limit", String(maxRequests));
+    res.setHeader("X-RateLimit-Remaining", String(remaining));
+    res.setHeader("X-RateLimit-Reset", String(resetAt));
     next();
   };
 };
