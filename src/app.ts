@@ -2,6 +2,7 @@ import express from "express";
 import { pool } from "./db";
 import { authenticateAccessToken } from "./middleware/auth";
 import { authRateLimit, userRateLimit } from "./middleware/rateLimit";
+import { requireApiVersion } from "./middleware/apiVersion";
 import { requestLogger } from "./middleware/requestLogger";
 import { authRoutes } from "./routes/authRoutes";
 import { profileRoutes } from "./routes/profileRoutes";
@@ -27,6 +28,7 @@ export const createApp = () => {
 
   app.use("/auth", authRateLimit, authRoutes);
 
+  app.use("/api", requireApiVersion);
   app.use("/api", authenticateAccessToken);
   app.use(userRateLimit);
 
