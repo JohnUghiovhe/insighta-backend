@@ -48,7 +48,15 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
   };
 };
 
-const resolveIpKey = (req: Request): string => req.ip || req.socket.remoteAddress || "unknown";
+const resolveIpKey = (req: Request): string => {
+  // Trust proxy to get real IP
+  const forwarded = req.header("x-forwarded-for");
+  if (forwarded) {
+    const ips = forwarded.split(",").map((ip) => ip.trim());
+    return ips[0] || "unknown";
+  }
+  return req.ip || req.socket.remoteAddress || "unknown";
+};
 
 const resolveUserKey = (req: Request): string => req.authUser?.id ?? resolveIpKey(req);
 
