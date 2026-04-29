@@ -1,4 +1,4 @@
-import { NextFunction, Request, Response } from "express";
+﻿import { NextFunction, Request, Response } from "express";
 import { AUTH_RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_MS, USER_RATE_LIMIT_MAX_REQUESTS } from "../config";
 import { toError } from "../utils/http";
 
@@ -11,15 +11,11 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
     const key = keyResolver(req);
     const now = Date.now();
     const current = rateStore.get(key);
-    
-    console.log(`[RateLimit] key: ${key}, current count: ${current?.count ?? 0}, max: ${maxRequests}, store size: ${rateStore.size}`);
 
     if (!current || now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
       rateStore.set(key, { count: 1, windowStart: now });
-      console.log(`[RateLimit] reset window for key: ${key}`);
     } else {
       current.count += 1;
-      console.log(`[RateLimit] incremented key: ${key} to count: ${current.count}`);
       if (current.count > maxRequests) {
         const retryAfterSeconds = Math.max(1, Math.ceil((RATE_LIMIT_WINDOW_MS - (now - current.windowStart)) / 1000));
         const resetAt = Math.floor((current.windowStart + RATE_LIMIT_WINDOW_MS) / 1000);
@@ -27,7 +23,6 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
         res.setHeader("X-RateLimit-Limit", String(maxRequests));
         res.setHeader("X-RateLimit-Remaining", "0");
         res.setHeader("X-RateLimit-Reset", String(resetAt));
-        console.log(`[RateLimit] ENFORCING 429 for key: ${key} (count: ${current.count})`);
         toError(res, 429, "Too Many Requests");
         return;
       }
@@ -49,7 +44,6 @@ const createRateLimit = (maxRequests: number, keyResolver: (req: Request) => str
     res.setHeader("X-RateLimit-Limit", String(maxRequests));
     res.setHeader("X-RateLimit-Remaining", String(remaining));
     res.setHeader("X-RateLimit-Reset", String(resetAt));
-    console.log(`[RateLimit] allowing key: ${key}, remaining: ${remaining}`);
     next();
   };
 };
@@ -59,13 +53,9 @@ const resolveIpKey = (req: Request): string => {
   const forwarded = req.header("x-forwarded-for");
   if (forwarded) {
     const ips = forwarded.split(",").map((ip) => ip.trim());
-    const ip = ips[0] || "unknown";
-    console.log(`[RateLimit] x-forwarded-for: ${forwarded} -> resolved to: ${ip}`);
-    return ip;
+    return ips[0] || "unknown";
   }
-  const fallback = req.ip || req.socket.remoteAddress || "unknown";
-  console.log(`[RateLimit] no x-forwarded-for, req.ip: ${req.ip}, socket: ${req.socket.remoteAddress} -> resolved to: ${fallback}`);
-  return fallback;
+  return req.ip || req.socket.remoteAddress || "unknown";
 };
 
 const resolveUserKey = (req: Request): string => req.authUser?.id ?? resolveIpKey(req);
