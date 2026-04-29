@@ -7,6 +7,17 @@ import { Role } from "../types";
 
 const getGithubScope = (): string => process.env.GITHUB_SCOPE || "read:user user:email";
 
+const getAdminGithubIds = (): Set<string> => {
+  const adminIds = process.env.ADMIN_GITHUB_IDS?.trim();
+  if (!adminIds) return new Set();
+  return new Set(adminIds.split(",").map((id) => id.trim()));
+};
+
+const determineUserRole = (githubUserId: number): string => {
+  const adminIds = getAdminGithubIds();
+  return adminIds.has(String(githubUserId)) ? "admin" : "analyst";
+};
+
 const getBrowserGithubOauthConfig = (): {
   clientId: string;
   clientSecret: string;
@@ -153,10 +164,11 @@ const upsertUserAndIssueTokens = async (
       }
     }
 
+    const userRole = determineUserRole(githubUser.id);
     const userResult = await client.query(
       `INSERT INTO users (
         id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at
-      ) VALUES ($1, $2, $3, $4, $5, 'analyst', TRUE, NOW(), NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, TRUE, NOW(), NOW())
       ON CONFLICT (github_id)
       DO UPDATE SET
         username = EXCLUDED.username,
@@ -164,7 +176,7 @@ const upsertUserAndIssueTokens = async (
         avatar_url = EXCLUDED.avatar_url,
         last_login_at = NOW()
       RETURNING id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at`,
-      [generateUuidV7(), String(githubUser.id), githubUser.login, email, githubUser.avatar_url]
+      [generateUuidV7(), String(githubUser.id), githubUser.login, email, githubUser.avatar_url, userRole]
     );
 
     const user = userResult.rows[0];

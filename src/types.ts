@@ -63,6 +63,8 @@ export type AuthUser = {
   avatar_url: string | null;
   role: Role;
   is_active: boolean;
+  last_login_at: string | null;
+  created_at: string;
 };
 
 export type Queryable = {

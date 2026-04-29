@@ -16,6 +16,28 @@ const toIsoOrNull = (value: unknown): string | null => {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 };
 
+export const getMe = async (req: Request, res: Response): Promise<void> => {
+  if (!req.authUser) {
+    toError(res, 401, "Unauthorized");
+    return;
+  }
+
+  res.status(200).json({
+    status: "success",
+    data: {
+      id: String(req.authUser.id),
+      github_id: String(req.authUser.github_id),
+      username: String(req.authUser.username),
+      email: req.authUser.email ? String(req.authUser.email) : null,
+      avatar_url: req.authUser.avatar_url ? String(req.authUser.avatar_url) : null,
+      role: String(req.authUser.role) as Role,
+      is_active: Boolean(req.authUser.is_active),
+      last_login_at: toIsoOrNull(req.authUser.last_login_at),
+      created_at: toIsoOrNull(req.authUser.created_at)
+    }
+  });
+};
+
 export const updateUserRole = async (req: Request, res: Response): Promise<void> => {
   const userId = typeof req.params.id === "string" ? req.params.id.trim() : "";
   const role = req.body?.role;

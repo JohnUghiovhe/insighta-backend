@@ -63,7 +63,9 @@ export const authenticateAccessToken = async (req: Request, res: Response, next:
       email: row.email ? String(row.email) : null,
       avatar_url: row.avatar_url ? String(row.avatar_url) : null,
       role: String(row.role) as Role,
-      is_active: Boolean(row.is_active)
+      is_active: Boolean(row.is_active),
+      last_login_at: row.last_login_at ? new Date(String(row.last_login_at)).toISOString() : null,
+      created_at: new Date(String(row.created_at)).toISOString()
     };
 
     next();
