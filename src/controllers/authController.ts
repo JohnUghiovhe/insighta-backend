@@ -13,9 +13,19 @@ const getAdminGithubIds = (): Set<string> => {
   return new Set(adminIds.split(",").map((id) => id.trim()));
 };
 
-const determineUserRole = (githubUserId: number): string => {
+const determineUserRole = async (client: { query: (text: string, params?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }> }, githubUserId: number): Promise<string> => {
   const adminIds = getAdminGithubIds();
-  return adminIds.has(String(githubUserId)) ? "admin" : "analyst";
+  if (adminIds.has(String(githubUserId))) {
+    return "admin";
+  }
+
+  const countResult = await client.query("SELECT COUNT(*)::int AS total FROM users");
+  const userCount = Number(countResult.rows[0]?.total ?? 0);
+  if (userCount === 0) {
+    return "admin";
+  }
+
+  return "analyst";
 };
 
 const getBrowserGithubOauthConfig = (): {
@@ -167,7 +177,7 @@ const upsertUserAndIssueTokens = async (
       }
     }
 
-    const userRole = determineUserRole(githubUser.id);
+    const userRole = await determineUserRole(client, githubUser.id);
     const userResult = await client.query(
       `INSERT INTO users (
         id, github_id, username, email, avatar_url, role, is_active, last_login_at, created_at

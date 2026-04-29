@@ -66,9 +66,20 @@ const run = async (): Promise<void> => {
   const seedData = JSON.parse(seedRaw) as { profiles?: SeedProfile[] };
   const rows = Array.isArray(seedData.profiles) ? seedData.profiles : [];
 
+  const resetProfiles = process.env.SEED_RESET === "true" || process.env.SEED_RESET === "1";
+  const resetAuth = process.env.AUTH_RESET === "true" || process.env.AUTH_RESET === "1";
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+
+    if (resetAuth) {
+      await client.query("TRUNCATE TABLE access_tokens, refresh_tokens, oauth_pkce_states, users RESTART IDENTITY CASCADE");
+    }
+
+    if (resetProfiles) {
+      await client.query("TRUNCATE TABLE profiles RESTART IDENTITY CASCADE");
+    }
 
     for (const profile of rows) {
       await client.query(
