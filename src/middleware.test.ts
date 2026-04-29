@@ -13,6 +13,7 @@ describe("requireApiVersion", () => {
   it("calls next when version header is 1", () => {
     const next = vi.fn();
     const res = {
+      setHeader: vi.fn(),
       status: vi.fn().mockReturnThis(),
       json: vi.fn()
     } as unknown as Response;
@@ -26,16 +27,17 @@ describe("requireApiVersion", () => {
 
   it("returns 400 when version header is missing", () => {
     const next = vi.fn();
+    const setHeader = vi.fn();
     const status = vi.fn().mockReturnThis();
     const json = vi.fn();
-    const res = { status, json } as unknown as Response;
+    const res = { setHeader, status, json } as unknown as Response;
     const req = {
       header: vi.fn().mockReturnValue(undefined)
     } as unknown as Request;
 
     requireApiVersion(req, res, next);
     expect(status).toHaveBeenCalledWith(400);
-    expect(json).toHaveBeenCalledWith({ status: "error", message: "API version header required" });
+    expect(json).toHaveBeenCalledWith({ status: "error", message: "API version header required: X-API-Version: 1" });
     expect(next).not.toHaveBeenCalled();
   });
 });
