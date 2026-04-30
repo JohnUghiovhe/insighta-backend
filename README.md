@@ -212,9 +212,9 @@ Supported query params include:
 Window is 60 seconds (in-memory counters):
 
 - `/auth/*`: 10 requests/minute per IP
-- authenticated API: 60 requests/minute per user (fallback to IP if user id missing)
+- all other endpoints: 60 requests/minute per authenticated user (fallback to IP if user id missing)
 
-Exceeded limit returns `429 Too many requests`.
+Exceeded limit returns `429 Too Many Requests`.
 
 ## Request Logging
 
