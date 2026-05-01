@@ -348,7 +348,7 @@ const profilesToCsv = (rows: ProfileRow[]): string => {
   return [headers.join(","), ...body].join("\n");
 };
 
-const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promise<ParsedFilters | null> => {
+export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promise<ParsedFilters | null> => {
   const q = rawQuery.toLowerCase().trim().replace(/\s+/g, " ");
   if (!q) return null;
 
@@ -368,14 +368,32 @@ const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promi
   if (/\badult(s)?\b/.test(q)) filters.age_group = "adult";
   if (/\bsenior(s)?\b/.test(q) || /\belderly\b/.test(q)) filters.age_group = "senior";
 
+  // age ranges: "above 30", "below 50", "between 25 and 46", "25-46", "25 to 46"
   const above = q.match(/\b(?:above|over|older than|greater than)\s+(\d{1,3})\b/);
   const below = q.match(/\b(?:below|under|younger than|less than)\s+(\d{1,3})\b/);
+  const between = q.match(/\bbetween\s+(\d{1,3})\s+(?:and|to|-)\s+(\d{1,3})\b/);
+  const hyphenRange = q.match(/\b(\d{1,3})\s*-\s*(\d{1,3})\b/);
+  const spacedRange = q.match(/\b(\d{1,3})\s+(?:to|and)\s+(\d{1,3})\b/);
+
   if (above) filters.min_age = Number(above[1]);
   if (below) filters.max_age = Number(below[1]);
+  if (between) {
+    filters.min_age = Number(between[1]);
+    filters.max_age = Number(between[2]);
+  } else if (hyphenRange) {
+    filters.min_age = Number(hyphenRange[1]);
+    filters.max_age = Number(hyphenRange[2]);
+  } else if (spacedRange) {
+    filters.min_age = Number(spacedRange[1]);
+    filters.max_age = Number(spacedRange[2]);
+  }
 
-  const from = q.match(/\bfrom\s+([a-z ]+?)\b(?:\s+(?:with|and|above|below|under|over|older|younger)|$)/);
+  // match `from <country>` allowing letters, spaces, hyphens and apostrophes
+  // allow the country to be followed by words like 'between', 'and', numeric ranges, or other qualifiers
+  const from = q.match(/\bfrom\s+([a-z'\- ]+?)(?=\s+(?:with|and|above|below|under|over|older|younger|between|to|\d)|$)/);
   if (from) {
-    const countryName = from[1].trim().replace(/\s+/g, " ");
+    // Normalize common separators (hyphen/underscore) to spaces so e.g. 'burkina-faso' -> 'burkina faso'
+    const countryName = from[1].trim().replace(/[-_]+/g, " ").replace(/\s+/g, " ");
     const result = await db.query("SELECT country_id FROM profiles WHERE LOWER(country_name) = LOWER($1) LIMIT 1", [
       countryName
     ]);
