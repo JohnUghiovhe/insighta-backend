@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { appendCursorCondition, encodeCursor, parseFilterQuery, parsePagingAndSort } from "./controllers/profileController";
+import {
+  appendCursorCondition,
+  encodeCursor,
+  parseFilterQuery,
+  parsePagingAndSort
+} from "./controllers/profileController";
+import { buildQueryCacheKey, normalizeParsedFilters } from "./utils/queryCache";
 
 vi.mock("./db", () => ({
   pool: {
@@ -104,5 +110,23 @@ describe("cursor SQL condition", () => {
     expect(clause).toContain("created_at < $2");
     expect(clause).toContain("id < $4");
     expect(values).toEqual(["male", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z", "id-1"]);
+  });
+});
+
+describe("query normalization", () => {
+  it("produces the same cache key for equivalent filters", () => {
+    const left = buildQueryCacheKey(
+      "list",
+      normalizeParsedFilters({ gender: "female", country_id: "ng", min_age: 20, max_age: 45 }),
+      { limit: 10, sortBy: "created_at", order: "desc", page: 1 }
+    );
+
+    const right = buildQueryCacheKey(
+      "list",
+      normalizeParsedFilters({ country_id: "NG", max_age: 45, min_age: 20, gender: "female" }),
+      { limit: 10, sortBy: "created_at", order: "desc", page: 1 }
+    );
+
+    expect(left).toBe(right);
   });
 });
