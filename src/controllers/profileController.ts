@@ -8,6 +8,8 @@ import {
   ALLOWED_SORT_COLUMNS,
   REQUEST_TIMEOUT_MS
 } from "../config";
+import { CsvRowParser, ParsedCsvRow, normalizeCsvHeader } from "../utils/csv";
+import { buildQueryCacheKey, createInMemoryCache, normalizeParsedFilters } from "../utils/queryCache";
 import {
   AgifyResponse,
   GenderizeResponse,
@@ -17,6 +19,50 @@ import {
   ProfileRow,
   Queryable
 } from "../types";
+
+type QueryCachePayload = {
+  total: number;
+  total_pages: number;
+  data: ProfileRow[];
+  next_cursor?: string | null;
+};
+
+type UploadReason =
+  | "broken_encoding"
+  | "database_error"
+  | "duplicate_name"
+  | "invalid_age"
+  | "invalid_gender"
+  | "invalid_probability"
+  | "malformed_row"
+  | "missing_fields";
+
+type UploadSummary = {
+  status: "success";
+  total_rows: number;
+  inserted: number;
+  skipped: number;
+  reasons: Partial<Record<UploadReason, number>>;
+};
+
+type UploadCandidate = {
+  name: string;
+  gender: ProfileRow["gender"];
+  age: number;
+  age_group: ProfileRow["age_group"];
+  country_id: string;
+  country_name: string;
+  gender_probability: number;
+  country_probability: number;
+};
+
+const QUERY_CACHE_TTL_MS = 30_000;
+const QUERY_CACHE_MAX_ENTRIES = 250;
+const CSV_UPLOAD_BATCH_SIZE = 500;
+const queryCache = createInMemoryCache<QueryCachePayload | ProfileRow | UploadSummary>(
+  QUERY_CACHE_MAX_ENTRIES,
+  QUERY_CACHE_TTL_MS
+);
 
 const toIso = (value: unknown): string => {
   if (value instanceof Date) return value.toISOString();
@@ -35,6 +81,155 @@ const normalizeProfileRow = (row: Record<string, unknown>): ProfileRow => ({
   country_probability: Number(row.country_probability),
   created_at: toIso(row.created_at)
 });
+
+const clearQueryCache = (): void => {
+  queryCache.clear();
+};
+
+const buildProfileCacheKey = (id: string): string => `profile|id=${id.toLowerCase()}`;
+
+const buildFilterCacheKey = (
+  scope: string,
+  filters: ParsedFilters,
+  paging?: Pick<PagingAndSort, "limit" | "order" | "sortBy" | "page"> & { cursor?: PagingAndSort["cursor"] }
+): string => buildQueryCacheKey(scope, normalizeParsedFilters(filters), paging);
+
+const buildUploadReasonMap = (): Record<UploadReason, number> => ({
+  broken_encoding: 0,
+  database_error: 0,
+  duplicate_name: 0,
+  invalid_age: 0,
+  invalid_gender: 0,
+  invalid_probability: 0,
+  malformed_row: 0,
+  missing_fields: 0
+});
+
+const incrementReason = (reasons: Record<UploadReason, number>, reason: UploadReason, amount = 1): void => {
+  reasons[reason] += amount;
+};
+
+const getAgeFromRow = (value: string): number | null => {
+  if (!value.trim()) return null;
+  const age = Number(value);
+  if (!Number.isInteger(age) || age < 0) return null;
+  return age;
+};
+
+const getProbabilityFromRow = (value: string | undefined): number | null => {
+  if (value === undefined || !value.trim()) return 0;
+  const parsed = Number(value);
+  if (Number.isNaN(parsed) || parsed < 0 || parsed > 1) return null;
+  return parsed;
+};
+
+const extractUploadCandidate = (
+  headerIndex: Map<string, number>,
+  row: ParsedCsvRow
+): { candidate?: UploadCandidate; reason?: UploadReason } => {
+  if (row.brokenEncoding) return { reason: "broken_encoding" };
+  if (row.malformed) return { reason: "malformed_row" };
+
+  const expectedColumns = headerIndex.size;
+  if (row.cells.length !== expectedColumns) return { reason: "malformed_row" };
+
+  const readValue = (key: string): string => {
+    const index = headerIndex.get(key);
+    if (index === undefined) return "";
+    return String(row.cells[index] ?? "").trim();
+  };
+
+  const name = readValue("name").toLowerCase();
+  const genderRaw = readValue("gender").toLowerCase();
+  const ageRaw = readValue("age");
+  const countryIdRaw = readValue("country_id").toUpperCase();
+  const countryName = readValue("country_name");
+  const genderProbabilityRaw = readValue("gender_probability");
+  const countryProbabilityRaw = readValue("country_probability");
+
+  if (!name || !genderRaw || !ageRaw || !countryIdRaw || !countryName) return { reason: "missing_fields" };
+  if (genderRaw !== "male" && genderRaw !== "female") return { reason: "invalid_gender" };
+
+  const age = getAgeFromRow(ageRaw);
+  if (age === null) return { reason: "invalid_age" };
+
+  const genderProbability = getProbabilityFromRow(genderProbabilityRaw);
+  if (genderProbability === null) return { reason: "invalid_probability" };
+
+  const countryProbability = getProbabilityFromRow(countryProbabilityRaw);
+  if (countryProbability === null) return { reason: "invalid_probability" };
+
+  if (!/^[A-Z]{2}$/.test(countryIdRaw)) return { reason: "invalid_probability" };
+
+  return {
+    candidate: {
+      name,
+      gender: genderRaw,
+      age,
+      age_group: getAgeGroup(age),
+      country_id: countryIdRaw,
+      country_name: countryName,
+      gender_probability: genderProbability,
+      country_probability: countryProbability
+    }
+  };
+};
+
+const getExistingNames = async (names: string[]): Promise<Set<string>> => {
+  if (names.length === 0) return new Set();
+  const result = await pool.query("SELECT LOWER(name) AS name FROM profiles WHERE LOWER(name) = ANY($1::text[])", [names]);
+  return new Set(result.rows.map((row) => String(row.name)));
+};
+
+const insertUploadBatch = async (
+  batch: UploadCandidate[],
+  reasons: Record<UploadReason, number>
+): Promise<{ inserted: number; skipped: number }> => {
+  const existing = await getExistingNames(batch.map((row) => row.name));
+  const insertable = batch.filter((row) => !existing.has(row.name));
+  incrementReason(reasons, "duplicate_name", batch.length - insertable.length);
+
+  if (insertable.length === 0) {
+    return { inserted: 0, skipped: batch.length };
+  }
+
+  const values: Array<string | number> = [];
+  const placeholders = insertable
+    .map((row, index) => {
+      const base = index * 9;
+      values.push(
+        generateUuidV7(),
+        row.name,
+        row.gender,
+        row.gender_probability,
+        row.age,
+        row.age_group,
+        row.country_id,
+        row.country_name,
+        row.country_probability
+      );
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7}, $${base + 8}, $${base + 9}, NOW())`;
+    })
+    .join(", ");
+
+  const insertedResult = await pool.query(
+    `INSERT INTO profiles (
+      id, name, gender, gender_probability, age, age_group,
+      country_id, country_name, country_probability, created_at
+    ) VALUES ${placeholders}
+    ON CONFLICT (LOWER(name)) DO NOTHING
+    RETURNING LOWER(name) AS name`,
+    values
+  );
+
+  const insertedCount = insertedResult.rows.length;
+  const skipped = batch.length - insertedCount;
+  if (skipped > batch.length - insertable.length) {
+    incrementReason(reasons, "duplicate_name", skipped - (batch.length - insertable.length));
+  }
+
+  return { inserted: insertedCount, skipped };
+};
 
 const getAgeGroup = (age: number): ProfileRow["age_group"] => {
   if (age <= 12) return "child";
@@ -306,6 +501,14 @@ const buildPaginationLinks = (req: Request, page: number, limit: number, totalPa
   };
 };
 
+const buildCursorLinks = (req: Request, limit: number, order: "asc" | "desc", nextCursor: string | null) => ({
+  self: `${req.path}?cursor=${encodeURIComponent(String(req.query.cursor || ""))}&limit=${limit}`,
+  next: nextCursor
+    ? `${req.path}?cursor=${encodeURIComponent(nextCursor)}&limit=${limit}&sort_by=created_at&order=${order}`
+    : null,
+  prev: null
+});
+
 const toCsvValue = (value: string | number): string => {
   const asString = String(value);
   if (asString.includes(",") || asString.includes("\"") || asString.includes("\n")) {
@@ -347,6 +550,23 @@ const profilesToCsv = (rows: ProfileRow[]): string => {
 
   return [headers.join(","), ...body].join("\n");
 };
+
+const buildQueryResponse = (
+  req: Request,
+  page: number,
+  limit: number,
+  total: number,
+  totalPages: number,
+  data: ProfileRow[]
+) => ({
+  status: "success",
+  page,
+  limit,
+  total,
+  total_pages: totalPages,
+  links: buildPaginationLinks(req, page, limit, totalPages),
+  data
+});
 
 export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promise<ParsedFilters | null> => {
   const q = rawQuery.toLowerCase().trim().replace(/\s+/g, " ");
@@ -473,6 +693,7 @@ export const createProfileHandlers = () => {
             profile.created_at
           ]
         );
+        clearQueryCache();
       } catch (insertError) {
         if (isUniqueNameConflict(insertError)) {
           const existingAfterConflict = await pool.query("SELECT * FROM profiles WHERE LOWER(name) = LOWER($1) LIMIT 1", [
@@ -509,6 +730,119 @@ export const createProfileHandlers = () => {
     }
   };
 
+  const uploadProfiles = async (req: Request, res: Response) => {
+    try {
+      const contentType = String(req.headers["content-type"] ?? "").toLowerCase();
+      if (!contentType.includes("csv") && !contentType.includes("text/plain") && !contentType.includes("application/octet-stream")) {
+        toError(res, 422, "Invalid upload format");
+        return;
+      }
+      const parser = new CsvRowParser();
+      const summaryReasons = buildUploadReasonMap();
+      const seenNames = new Set<string>();
+      const pendingBatch: UploadCandidate[] = [];
+      let headerIndex: Map<string, number> | null = null;
+      let totalRows = 0;
+      let inserted = 0;
+      let chain = Promise.resolve();
+
+      const flushBatch = async (): Promise<void> => {
+        if (pendingBatch.length === 0) return;
+        try {
+          const result = await insertUploadBatch([...pendingBatch], summaryReasons);
+          inserted += result.inserted;
+          clearQueryCache();
+        } catch {
+          incrementReason(summaryReasons, "database_error", pendingBatch.length);
+        } finally {
+          pendingBatch.length = 0;
+        }
+      };
+
+      const processParsedRow = async (row: ParsedCsvRow): Promise<void> => {
+        if (headerIndex === null) {
+          const normalizedHeader = row.cells.map(normalizeCsvHeader);
+          headerIndex = new Map<string, number>();
+          normalizedHeader.forEach((value, index) => {
+            if (!headerIndex!.has(value)) headerIndex!.set(value, index);
+          });
+          return;
+        }
+
+        totalRows += 1;
+        const extracted = extractUploadCandidate(headerIndex, row);
+        if (extracted.reason) {
+          incrementReason(summaryReasons, extracted.reason);
+          return;
+        }
+
+        const candidate = extracted.candidate!;
+        if (seenNames.has(candidate.name)) {
+          incrementReason(summaryReasons, "duplicate_name");
+          return;
+        }
+
+        seenNames.add(candidate.name);
+        pendingBatch.push(candidate);
+        if (pendingBatch.length >= CSV_UPLOAD_BATCH_SIZE) {
+          await flushBatch();
+        }
+      };
+
+      const processChunk = async (chunk: string): Promise<void> => {
+        for (const row of parser.push(chunk)) {
+          await processParsedRow(row);
+        }
+      };
+
+      req.setEncoding("utf8");
+
+      await new Promise<void>((resolve, reject) => {
+        req.on("data", (chunk: string) => {
+          req.pause();
+          chain = chain
+            .then(() => processChunk(chunk))
+            .then(() => {
+              req.resume();
+            })
+            .catch((error) => {
+              reject(error);
+            });
+        });
+
+        req.once("end", () => {
+          chain
+            .then(async () => {
+              const finalRow = parser.finish();
+              if (finalRow) {
+                await processParsedRow(finalRow);
+              }
+              await flushBatch();
+              resolve();
+            })
+            .catch(reject);
+        });
+
+        req.once("error", reject);
+      });
+
+      const skipped = totalRows - inserted;
+      const compactReasons = Object.fromEntries(
+        Object.entries(summaryReasons).filter(([, count]) => count > 0)
+      ) as Partial<Record<UploadReason, number>>;
+
+      res.status(200).json({
+        status: "success",
+        total_rows: totalRows,
+        inserted,
+        skipped,
+        reasons: compactReasons
+      } satisfies UploadSummary);
+    } catch (error) {
+      toError(res, 500, error instanceof Error ? error.message : "Server failure");
+    }
+  };
+
   const searchProfiles = async (req: Request, res: Response) => {
     try {
       if (Array.isArray(req.query.q) || typeof req.query.q !== "string" || !req.query.q.trim()) {
@@ -536,25 +870,37 @@ export const createProfileHandlers = () => {
         return;
       }
 
-      const { clause, values } = buildWhereClause(interpreted);
-      const offset = (page - 1) * limit;
-      const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values);
-      const total = Number(totalResult.rows[0]?.total ?? 0);
-      const listResult = await pool.query(
-        `SELECT * FROM profiles ${clause} ORDER BY created_at DESC, id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
-        [...values, limit, offset]
-      );
-      const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+      const normalizedFilters = normalizeParsedFilters(interpreted);
+      const cacheKey = buildQueryCacheKey("search", normalizedFilters, { page, limit, sortBy: "created_at", order: "desc" });
+      const cached = queryCache.get(cacheKey) as QueryCachePayload | undefined;
+      if (cached) {
+        res.status(200).json({
+          status: "success",
+          page,
+          limit,
+          total: cached.total,
+          total_pages: cached.total_pages,
+          links: buildPaginationLinks(req, page, limit, cached.total_pages),
+          data: cached.data
+        });
+        return;
+      }
 
-      res.status(200).json({
-        status: "success",
-        page,
-        limit,
-        total,
-        total_pages: totalPages,
-        links: buildPaginationLinks(req, page, limit, totalPages),
-        data: listResult.rows.map((row) => normalizeProfileRow(row))
-      });
+      const { clause, values } = buildWhereClause(normalizedFilters);
+      const offset = (page - 1) * limit;
+      const [totalResult, listResult] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values),
+        pool.query(
+          `SELECT * FROM profiles ${clause} ORDER BY created_at DESC, id DESC LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+          [...values, limit, offset]
+        )
+      ]);
+      const total = Number(totalResult.rows[0]?.total ?? 0);
+      const totalPages = total === 0 ? 0 : Math.ceil(total / limit);
+      const data = listResult.rows.map((row) => normalizeProfileRow(row));
+      queryCache.set(cacheKey, { total, total_pages: totalPages, data });
+
+      res.status(200).json(buildQueryResponse(req, page, limit, total, totalPages, data));
     } catch {
       toError(res, 500, "Server failure");
     }
@@ -562,13 +908,23 @@ export const createProfileHandlers = () => {
 
   const getProfile = async (req: Request, res: Response) => {
     try {
-      const result = await pool.query("SELECT * FROM profiles WHERE id = $1 LIMIT 1", [req.params.id]);
+      const profileId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+      const cacheKey = buildProfileCacheKey(profileId);
+      const cached = queryCache.get(cacheKey) as ProfileRow | undefined;
+      if (cached) {
+        res.status(200).json({ status: "success", data: cached });
+        return;
+      }
+
+      const result = await pool.query("SELECT * FROM profiles WHERE id = $1 LIMIT 1", [profileId]);
       const profile = result.rows[0];
       if (!profile) {
         toError(res, 404, "Profile not found");
         return;
       }
-      res.status(200).json({ status: "success", data: normalizeProfileRow(profile) });
+      const normalized = normalizeProfileRow(profile);
+      queryCache.set(cacheKey, normalized);
+      res.status(200).json({ status: "success", data: normalized });
     } catch {
       toError(res, 500, "Server failure");
     }
@@ -583,23 +939,46 @@ export const createProfileHandlers = () => {
         return;
       }
 
-      const { clause, values } = buildWhereClause(parsedFilters);
+      const normalizedFilters = normalizeParsedFilters(parsedFilters);
+      const cacheKey = buildQueryCacheKey("list", normalizedFilters, pageSort);
+      const cached = queryCache.get(cacheKey) as QueryCachePayload | undefined;
+      if (cached) {
+        res.status(200).json({
+          status: "success",
+          page: pageSort.page ?? 1,
+          limit: pageSort.limit,
+          total: cached.total,
+          total_pages: cached.total_pages,
+          links: pageSort.cursor
+            ? buildCursorLinks(req, pageSort.limit, pageSort.order, cached.next_cursor || null)
+            : buildPaginationLinks(req, pageSort.page ?? 1, pageSort.limit, cached.total_pages),
+          next_cursor: cached.next_cursor ?? null,
+          data: cached.data
+        });
+        return;
+      }
+
+      const { clause, values } = buildWhereClause(normalizedFilters);
       const orderBy = `${pageSort.sortBy} ${pageSort.order.toUpperCase()}, id ${pageSort.order.toUpperCase()}`;
-      const totalResult = await pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values);
-      const total = Number(totalResult.rows[0]?.total ?? 0);
-      const totalPages = total === 0 ? 0 : Math.ceil(total / pageSort.limit);
+      const totalResultPromise = pool.query(`SELECT COUNT(*)::int AS total FROM profiles ${clause}`, values);
 
       if (pageSort.cursor) {
         const cursorValues = [...values];
         const cursorClause = appendCursorCondition(clause, pageSort.order, pageSort.cursor, cursorValues);
-        const cursorResult = await pool.query(
-          `SELECT * FROM profiles ${cursorClause} ORDER BY ${orderBy} LIMIT $${cursorValues.length + 1}`,
-          [...cursorValues, pageSort.limit + 1]
-        );
+        const [totalResult, cursorResult] = await Promise.all([
+          totalResultPromise,
+          pool.query(
+            `SELECT * FROM profiles ${cursorClause} ORDER BY ${orderBy} LIMIT $${cursorValues.length + 1}`,
+            [...cursorValues, pageSort.limit + 1]
+          )
+        ]);
+        const total = Number(totalResult.rows[0]?.total ?? 0);
+        const totalPages = total === 0 ? 0 : Math.ceil(total / pageSort.limit);
         const hasMore = cursorResult.rows.length > pageSort.limit;
         const dataRows = hasMore ? cursorResult.rows.slice(0, pageSort.limit) : cursorResult.rows;
         const data = dataRows.map((row) => normalizeProfileRow(row));
         const nextCursor = hasMore && data.length > 0 ? encodeCursor(data[data.length - 1]) : null;
+        queryCache.set(cacheKey, { total, total_pages: totalPages, data, next_cursor: nextCursor });
 
         res.status(200).json({
           status: "success",
@@ -607,13 +986,7 @@ export const createProfileHandlers = () => {
           limit: pageSort.limit,
           total,
           total_pages: totalPages,
-          links: {
-            self: `${req.path}?cursor=${encodeURIComponent(String(req.query.cursor || ""))}&limit=${pageSort.limit}`,
-            next: nextCursor
-              ? `${req.path}?cursor=${encodeURIComponent(nextCursor)}&limit=${pageSort.limit}&sort_by=created_at&order=${pageSort.order}`
-              : null,
-            prev: null
-          },
+          links: buildCursorLinks(req, pageSort.limit, pageSort.order, nextCursor),
           next_cursor: nextCursor,
           data
         });
@@ -621,10 +994,17 @@ export const createProfileHandlers = () => {
       }
 
       const offset = ((pageSort.page ?? 1) - 1) * pageSort.limit;
-      const listResult = await pool.query(
-        `SELECT * FROM profiles ${clause} ORDER BY ${orderBy} LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
-        [...values, pageSort.limit, offset]
-      );
+      const [totalResult, listResult] = await Promise.all([
+        totalResultPromise,
+        pool.query(
+          `SELECT * FROM profiles ${clause} ORDER BY ${orderBy} LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
+          [...values, pageSort.limit, offset]
+        )
+      ]);
+      const total = Number(totalResult.rows[0]?.total ?? 0);
+      const totalPages = total === 0 ? 0 : Math.ceil(total / pageSort.limit);
+      const data = listResult.rows.map((row) => normalizeProfileRow(row));
+      queryCache.set(cacheKey, { total, total_pages: totalPages, data });
 
       res.status(200).json({
         status: "success",
@@ -633,7 +1013,7 @@ export const createProfileHandlers = () => {
         total,
         total_pages: totalPages,
         links: buildPaginationLinks(req, pageSort.page ?? 1, pageSort.limit, totalPages),
-        data: listResult.rows.map((row) => normalizeProfileRow(row))
+        data
       });
     } catch {
       toError(res, 500, "Server failure");
@@ -676,11 +1056,12 @@ export const createProfileHandlers = () => {
         toError(res, 404, "Profile not found");
         return;
       }
+      clearQueryCache();
       res.status(204).send();
     } catch {
       toError(res, 500, "Server failure");
     }
   };
 
-  return { createProfile, searchProfiles, getProfile, listProfiles, exportProfiles, deleteProfile };
+  return { createProfile, uploadProfiles, searchProfiles, getProfile, listProfiles, exportProfiles, deleteProfile };
 };
