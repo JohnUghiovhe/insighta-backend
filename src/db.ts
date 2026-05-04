@@ -39,6 +39,12 @@ export const initializeDatabase = async (): Promise<void> => {
     CREATE INDEX IF NOT EXISTS idx_profiles_country_id ON profiles(country_id);
     CREATE INDEX IF NOT EXISTS idx_profiles_age ON profiles(age);
     CREATE INDEX IF NOT EXISTS idx_profiles_created_at ON profiles(created_at);
+    CREATE INDEX IF NOT EXISTS idx_profiles_created_at_id ON profiles(created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_profiles_gender_created_at_id ON profiles(gender, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_profiles_age_group_created_at_id ON profiles(age_group, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_profiles_country_id_created_at_id ON profiles(country_id, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_profiles_age_created_at_id ON profiles(age, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_profiles_gender_probability_created_at_id ON profiles(gender_probability, created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_profiles_gender_probability ON profiles(gender_probability);
     CREATE INDEX IF NOT EXISTS idx_profiles_country_probability ON profiles(country_probability);
     CREATE INDEX IF NOT EXISTS idx_profiles_country_name ON profiles(country_name);
