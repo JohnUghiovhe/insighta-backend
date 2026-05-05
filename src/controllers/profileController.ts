@@ -608,15 +608,104 @@ export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string)
     filters.max_age = Number(spacedRange[2]);
   }
 
-  // match `from <country>` allowing letters, spaces, hyphens and apostrophes
-  // allow the country to be followed by words like 'between', 'and', numeric ranges, or other qualifiers
-  const from = q.match(/\bfrom\s+([a-z'\- ]+?)(?=\s+(?:with|and|above|below|under|over|older|younger|between|to|\d)|$)/);
+  // Country extraction with multiple patterns:
+  // 1. "from <country>" - e.g., "from nigeria", "from burkina-faso"
+  // 2. Country adjectives - e.g., "nigerian", "kenyan", "ghanaian"
+  // 3. Standalone country names - e.g., "nigeria", "kenya", "ghana"
+  let countryName: string | null = null;
+
+  // Pattern 1: "from <country>"
+  const from = q.match(/\bfrom\s+([a-z'\- ]+?)(?=\s+(?:aged|with|and|above|below|under|over|older|younger|between|to|years?|\d)|$)/);
   if (from) {
-    // Normalize common separators (hyphen/underscore) to spaces so e.g. 'burkina-faso' -> 'burkina faso'
-    const countryName = from[1].trim().replace(/[-_]+/g, " ").replace(/\s+/g, " ");
-    const result = await db.query("SELECT country_id FROM profiles WHERE LOWER(country_name) = LOWER($1) LIMIT 1", [
-      countryName
-    ]);
+    countryName = from[1].trim().replace(/[-_]+/g, " ").replace(/\s+/g, " ");
+  }
+
+  // Pattern 2: Country adjectives (if not found via "from")
+  if (!countryName) {
+    const countryAdjectives: Record<string, string> = {
+      "nigerian": "Nigeria",
+      "kenyan": "Kenya",
+      "ghanaian": "Ghana",
+      "ivorian": "Ivory Coast",
+      "tanzanian": "Tanzania",
+      "ugandan": "Uganda",
+      "malian": "Mali",
+      "burkinabe": "Burkina Faso",
+      "beninese": "Benin",
+      "togolese": "Togo",
+      "cameroonian": "Cameroon",
+      "senegalese": "Senegal",
+      "sierra leonean": "Sierra Leone",
+      "liberian": "Liberia",
+      "guinean": "Guinea",
+      "congolese": "Democratic Republic of the Congo",
+      "sudanese": "Sudan",
+      "egyptian": "Egypt",
+      "moroccan": "Morocco",
+      "algerian": "Algeria",
+      "tunisian": "Tunisia",
+      "southafrican": "South Africa",
+      "angolan": "Angola",
+      "mozambican": "Mozambique",
+      "zimbabwean": "Zimbabwe",
+      "zambian": "Zambia",
+      "rwandan": "Rwanda",
+      "burundian": "Burundi",
+      "ethiopian": "Ethiopia",
+      "somali": "Somalia",
+      "indonesian": "Indonesia",
+      "malay": "Malaysia",
+      "indian": "India",
+      "bangladeshi": "Bangladesh",
+      "pakistani": "Pakistan",
+      "thai": "Thailand",
+      "vietnamese": "Vietnam",
+      "philippine": "Philippines",
+      "mexican": "Mexico",
+      "brazilian": "Brazil",
+      "american": "United States",
+      "canadian": "Canada",
+      "australian": "Australia",
+      "british": "United Kingdom",
+      "french": "France",
+      "german": "Germany",
+      "spanish": "Spain",
+      "italian": "Italy",
+      "dutch": "Netherlands",
+      "swiss": "Switzerland"
+    };
+
+    for (const [adjective, country] of Object.entries(countryAdjectives)) {
+      if (q.includes(adjective)) {
+        countryName = country;
+        break;
+      }
+    }
+  }
+
+  // Pattern 3: Standalone country names (if still not found)
+  if (!countryName) {
+    // Query database for all country names and match them against the query
+    const countriesResult = await db.query("SELECT DISTINCT LOWER(country_name) as country_name FROM profiles ORDER BY country_name");
+    const dbCountries = countriesResult.rows.map((r) => r.country_name as string);
+
+    for (const dbCountry of dbCountries) {
+      // Escape regex special chars and match as word boundary
+      const regex = new RegExp(`\\b${dbCountry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+      if (regex.test(q)) {
+        // Capitalize for lookup
+        countryName = dbCountry
+          .split(" ")
+          .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+          .join(" ");
+        break;
+      }
+    }
+  }
+
+  // Lookup country_id from country_name
+  if (countryName) {
+    const result = await db.query("SELECT country_id FROM profiles WHERE LOWER(country_name) = LOWER($1) LIMIT 1", [countryName]);
     const row = result.rows[0];
     if (row?.country_id) {
       filters.country_id = String(row.country_id);
