@@ -8,7 +8,7 @@ This document outlines the complete implementation of three interconnected optim
 2. **Query Normalization**: Deterministic cache key generation for semantic query deduplication
 3. **CSV Ingestion**: Streaming parser with batch inserts and partial success semantics
 
-All three components are **working** and **production-ready**. Tests pass (13/13), build succeeds (0 errors), and the implementation is integrated into the main API surface.
+All three components are **working** and **production-ready**. Tests pass (14/14), build succeeds (0 errors), and the implementation is integrated into the main API surface.
 
 ---
 
@@ -44,6 +44,7 @@ This two-round-trip pattern incurs significant latency, especially under high qu
   - `searchProfiles()`: same pattern
   - `getProfile()`: cached by individual profile ID
   - All mutation handlers (`createProfile`, `updateProfile`, `deleteProfile`) call `clearQueryCache()` after database operation
+  - Natural-language parsing now normalizes en-dash/em-dash age ranges and hyphenated country names before lookup
 
 **Database Layer Enhancement:**
 - **File**: `src/db.ts`
@@ -76,25 +77,23 @@ These represent the same logical query, but different object key ordering produc
 ### Solution: Deterministic Filter Canonicalization
 
 **Approach:**
-1. Before generating a cache key, normalize the filter object by:
-   - **Alphabetically sorting** filter keys
-   - **Canonicalizing values** (e.g., country codes to uppercase, gender to lowercase)
-   - **Hashing** the normalized object to produce a fixed-length cache key
+1. Before generating a cache key, normalize the filter object by canonicalizing values:
+  - country codes are uppercased
+  - gender and age-group values are lowercased
+  - numeric bounds and pagination values are preserved as-is
 
-2. Cache key structure: `${scope}|${normalizedHash}|${pageSize}:${pageNum}`
-   - `scope`: "profile_list", "profile_search", etc.
-   - `normalizedHash`: deterministic hash of normalized filters
-   - `pageSize:pageNum`: pagination identifier
+2. Cache key structure is a deterministic string built from the normalized scope, filters, and paging values, for example:
+  - `scope`: `list` or `search`
+  - normalized filters: `gender=female|country_id=NG|min_age=20|max_age=45`
+  - paging values: `page=1|limit=10|sortBy=created_at|order=desc`
 
 **Implementation Details:**
 
 - **File**: `src/utils/queryCache.ts`
   - `normalizeParsedFilters(filters)`: 
-    - Iterates over filter keys in alphabetical order
     - Normalizes country_id to uppercase (e.g., "ng" → "NG")
     - Normalizes gender to lowercase (e.g., "Female" → "female")
-    - Creates a deterministic string representation
-    - Returns normalized object and computed hash
+   - Returns a normalized object that is fed into `buildQueryCacheKey()`
   - `buildQueryCacheKey(scope, normalizedFilters, paging)`: constructs the final key
 
 - **File**: `src/controllers/profileController.ts` (modified)
@@ -105,6 +104,7 @@ These represent the same logical query, but different object key ordering produc
 - Semantically identical queries collapse to a single cache entry
 - Redundant database work is eliminated
 - Cache hit ratio increases by eliminating duplicate logical queries
+- Parser coverage is broader for real-world queries like `Mozambique women aged 20–35` and `burkina-faso women aged 20-35`
 
 ---
 
@@ -258,7 +258,7 @@ Current batch upload workflow has several limitations:
 | **Query Latency (P50, paginated search)** | ~400ms | ~200ms | 50% reduction |
 | **Query Latency (P50, cached repeat)** | ~400ms | ~5–10ms | 97% reduction |
 | **Database Round-Trips per List/Search** | 2 | 1 | 50% reduction |
-| **Cache Hit Ratio (typical workload)** | 0% | 60–70% | N/A |
+| **Cache Hit Ratio (typical workload)** | 0% | 60–70% | +60–70 percentage points |
 | **Query Load on Primary DB** | 100% | 30–40% | 60–70% reduction |
 | **500k-Row Ingestion Time** | ~5000s (1.4 hrs) | ~10–30s | **100x+ improvement** |
 | **Memory per Batch Insert** | N/A | ~100KB (500 rows) | Bounded |
@@ -363,7 +363,7 @@ Result: all 50000 rows inserted (idempotent)
 
 ### Test & Build Summary
 
-- Tests: 13/13 passing (see `src/profileController.test.ts` and `src/middleware.test.ts`).
+- Tests: 14/14 passing (see `src/profileController.test.ts` and `src/middleware.test.ts`).
 - Build: TypeScript compiled successfully with 0 errors; build artifacts available in `dist/`.
 
 ### Code Locations
@@ -378,7 +378,7 @@ Result: all 50000 rows inserted (idempotent)
 - `src/db.ts` — 9 index creation statements
 
 **Test files:**
-- `src/profileController.test.ts` — 13 tests for query cache, CSV upload, partial success
+- `src/profileController.test.ts` — 8 tests for query cache, cursor pagination, and natural-language parsing
 - `src/middleware.test.ts` — 6 tests for auth, rate limit, request logging
 
 ---
