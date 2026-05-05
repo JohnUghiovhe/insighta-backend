@@ -569,7 +569,9 @@ const buildQueryResponse = (
 });
 
 export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string): Promise<ParsedFilters | null> => {
-  const q = rawQuery.toLowerCase().trim().replace(/\s+/g, " ");
+  // Normalize dashes: en-dash (–) and em-dash (—) to hyphen-minus (-)
+  const normalized = rawQuery.replace(/[–—]/g, "-");
+  const q = normalized.toLowerCase().trim().replace(/\s+/g, " ");
   if (!q) return null;
 
   const filters: ParsedFilters = {};
@@ -589,6 +591,7 @@ export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string)
   if (/\bsenior(s)?\b/.test(q) || /\belderly\b/.test(q)) filters.age_group = "senior";
 
   // age ranges: "above 30", "below 50", "between 25 and 46", "25-46", "25 to 46"
+  // Note: handles both hyphen-minus (-), en-dash (–), and em-dash (—)
   const above = q.match(/\b(?:above|over|older than|greater than)\s+(\d{1,3})\b/);
   const below = q.match(/\b(?:below|under|younger than|less than)\s+(\d{1,3})\b/);
   const between = q.match(/\bbetween\s+(\d{1,3})\s+(?:and|to|-)\s+(\d{1,3})\b/);
@@ -609,15 +612,16 @@ export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string)
   }
 
   // Country extraction with multiple patterns:
-  // 1. "from <country>" - e.g., "from nigeria", "from burkina-faso"
-  // 2. Country adjectives - e.g., "nigerian", "kenyan", "ghanaian"
-  // 3. Standalone country names - e.g., "nigeria", "kenya", "ghana"
+  // 1. "from <country>" - e.g., "from nigeria", "from burkina-faso", "from mozambique"
+  // 2. Country adjectives - e.g., "nigerian", "kenyan", "mozambican"
+  // 3. Standalone country names - e.g., "nigeria", "kenya", "mozambique"
   let countryName: string | null = null;
 
-  // Pattern 1: "from <country>"
-  const from = q.match(/\bfrom\s+([a-z'\- ]+?)(?=\s+(?:aged|with|and|above|below|under|over|older|younger|between|to|years?|\d)|$)/);
+  // Pattern 1: "from <country>" - improved to better capture hyphenated names
+  // Matches: "from nigeria", "from burkina-faso", "from mozambique women aged 20-35"
+  const from = q.match(/\bfrom\s+([a-z\-' ]+?)(?:\s+(?:aged|with|and|above|below|under|over|older|younger|between|women?|men?|to|years?|males?|females?)|\s*$)/);
   if (from) {
-    countryName = from[1].trim().replace(/[-_]+/g, " ").replace(/\s+/g, " ");
+    countryName = from[1].trim().replace(/\s*-\s*/g, " ").replace(/\s+/g, " ");
   }
 
   // Pattern 2: Country adjectives (if not found via "from")
@@ -688,11 +692,11 @@ export const parseNaturalLanguageQuery = async (db: Queryable, rawQuery: string)
     // Query database for all country names and match them against the query
     const countriesResult = await db.query("SELECT DISTINCT LOWER(country_name) as country_name FROM profiles ORDER BY country_name");
     const dbCountries = countriesResult.rows.map((r) => r.country_name as string);
+    const normalizedQuery = q.replace(/[-\s]+/g, "");
 
     for (const dbCountry of dbCountries) {
-      // Escape regex special chars and match as word boundary
-      const regex = new RegExp(`\\b${dbCountry.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
-      if (regex.test(q)) {
+      const normalizedCountry = dbCountry.replace(/[-\s]+/g, "");
+      if (normalizedQuery.includes(normalizedCountry)) {
         // Capitalize for lookup
         countryName = dbCountry
           .split(" ")
