@@ -3,13 +3,16 @@ import {
   appendCursorCondition,
   encodeCursor,
   parseFilterQuery,
+  parseNaturalLanguageQuery,
   parsePagingAndSort
 } from "./controllers/profileController";
 import { buildQueryCacheKey, normalizeParsedFilters } from "./utils/queryCache";
 
+const { poolQuery } = vi.hoisted(() => ({ poolQuery: vi.fn() }));
+
 vi.mock("./db", () => ({
   pool: {
-    query: vi.fn()
+    query: poolQuery
   }
 }));
 
@@ -128,5 +131,46 @@ describe("query normalization", () => {
     );
 
     expect(left).toBe(right);
+  });
+});
+
+describe("natural language query parsing", () => {
+  it("parses en-dash age ranges and hyphenated country names", async () => {
+    poolQuery.mockImplementation(async (sql: string) => {
+      if (sql.includes("SELECT DISTINCT LOWER(country_name)")) {
+        return {
+          rows: [
+            { country_name: "mozambique" },
+            { country_name: "burkina faso" }
+          ]
+        };
+      }
+
+      if (sql.includes("SELECT country_id FROM profiles")) {
+        return {
+          rows: [{ country_id: "MZ" }]
+        };
+      }
+
+      return { rows: [] };
+    });
+
+    const parsed = await parseNaturalLanguageQuery({ query: poolQuery } as never, "Mozambique women aged 20–35");
+
+    expect(parsed).toEqual({
+      gender: "female",
+      min_age: 20,
+      max_age: 35,
+      country_id: "MZ"
+    });
+
+    const hyphenated = await parseNaturalLanguageQuery({ query: poolQuery } as never, "burkina-faso women aged 20-35");
+
+    expect(hyphenated).toEqual({
+      gender: "female",
+      min_age: 20,
+      max_age: 35,
+      country_id: "MZ"
+    });
   });
 });
