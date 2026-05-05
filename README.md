@@ -54,7 +54,10 @@ This README now reflects the current implementation:
 - documents CLI OAuth handshake endpoints (`/auth/github/init` and `/auth/github/exchange`)
 - includes protected `GET /auth/me`
 - clarifies parser behavior and examples used by `insighta profiles search`
+- documents CSV ingestion at `POST /api/profiles/upload`
+- links the Postman workspace for manual API testing
 - captures list pagination behavior, including cursor mode for `created_at`
+- documents the in-memory query cache and mutation-driven cache invalidation
 - adds cross-repo docs table and frontend placeholder
 
 ## System Architecture
@@ -199,6 +202,8 @@ Supported query params include:
   - page mode: `page`, `limit`
   - cursor mode: `cursor`, `limit` (only when `sort_by=created_at` and no `page`)
 
+List responses are served through a canonicalized query cache keyed on normalized filters, sort, paging, and cursor state. The cache is in-memory, capped at 250 entries, and uses a 30-second TTL.
+
 ### Export Profiles
 
 `GET /api/profiles/export?format=csv` returns CSV with the same filter/sort semantics.
@@ -206,6 +211,49 @@ Supported query params include:
 ### Search Profiles
 
 `GET /api/profiles/search?q=...` supports natural-language parser + page pagination (`page`, `limit`).
+
+Search requests use the same normalized filter cache as list requests, so semantically equivalent queries reuse the same cached response.
+
+### Upload Profiles
+
+`POST /api/profiles/upload` accepts CSV payloads and is restricted to admin users.
+
+Supported content types:
+
+- `text/csv`
+- `text/plain`
+- `application/octet-stream`
+
+Expected columns, in any order:
+
+- `name`
+- `gender`
+- `age`
+- `country_id`
+- `country_name`
+- `gender_probability`
+- `country_probability`
+
+Behavior:
+
+- rows are streamed and processed incrementally
+- valid rows are inserted in batches
+- duplicate names are skipped
+- malformed or invalid rows are counted in the response summary
+
+Typical response shape:
+
+```json
+{
+  "status": "success",
+  "total_rows": 15,
+  "inserted": 14,
+  "skipped": 1,
+  "reasons": {
+    "duplicate_name": 1
+  }
+}
+```
 
 ## Rate Limiting
 
@@ -215,6 +263,19 @@ Window is 60 seconds (in-memory counters):
 - all other endpoints: 60 requests/minute per authenticated user (fallback to IP if user id missing)
 
 Exceeded limit returns `429 Too Many Requests`.
+
+## Scaling Notes
+
+The implementation is intentionally lightweight, but the core paths are designed to scale predictably:
+
+- CSV ingestion uses streaming parsing instead of loading the full file into memory.
+- Uploads are batched to reduce per-row insert overhead.
+- Profile search and list endpoints normalize filters before building cache keys, so equivalent queries collapse to the same cache entry.
+- The query cache is a 250-entry in-memory LRU with a 30-second TTL.
+- Mutating profile routes clear the query cache so search and list results do not serve stale data.
+- Cursor pagination is available for `created_at` ordering to avoid deep offset scans.
+- OAuth token handling is stateless at the request layer; persistence is limited to hashed tokens and transient PKCE state.
+- Rate limiting is in-memory today, which is enough for single-instance deployment but should move to a shared store if the service is horizontally scaled.
 
 ## Request Logging
 
@@ -234,7 +295,7 @@ Each completed response logs a structured JSON object with:
 | --- | --- |
 | Health | `GET /health` |
 | Auth | `GET /auth/github`, `GET /auth/github/init`, `GET /auth/github/callback`, `POST /auth/github/exchange`, `GET /auth/me`, `POST /auth/refresh`, `POST /auth/logout` |
-| Profiles | `GET /api/profiles`, `GET /api/profiles/:id`, `GET /api/profiles/search`, `GET /api/profiles/export`, `POST /api/profiles`, `DELETE /api/profiles/:id` |
+| Profiles | `GET /api/profiles`, `GET /api/profiles/:id`, `GET /api/profiles/search`, `GET /api/profiles/export`, `POST /api/profiles/upload`, `POST /api/profiles`, `DELETE /api/profiles/:id` |
 
 ## Environment Variables
 
