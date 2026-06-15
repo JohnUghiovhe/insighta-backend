@@ -4,11 +4,11 @@
   "description": "",
   "main": "dist/server.js",
   "scripts": {
-    "build": "tsc",
-    "dev": "tsx watch --exclude data/** --exclude dist/** src/server.ts",
+    "build": "node init && tsc",
+    "dev": "node init && tsx watch --exclude data/** --exclude dist/** src/server.ts",
     "lint": "tsc --noEmit",
     "seed": "tsx src/seed.ts",
-    "start": "node dist/server.js",
+    "start": "node init && node dist/server.js",
     "test": "vitest run"
   },
   "keywords": [],
