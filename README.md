@@ -24,8 +24,8 @@ Use this table to jump between full docs across repos.
 | Surface | URL | Status |
 | --- | --- | --- |
 | Frontend | https://insighta-web-pied.vercel.app/ | Live |
-| Backend Base | https://intelligence-query-engine-production.up.railway.app/ | Live |
-| Backend Health | https://intelligence-query-engine-production.up.railway.app/health | Live |
+| Backend Base | https://insighta-labs-backend-g7l0.onrender.com | Live |
+| Backend Health | https://insighta-labs-backend-g7l0.onrender.com/health | Live |
 
 ## System Expectations
 
@@ -340,7 +340,7 @@ USER_RATE_LIMIT_MAX_REQUESTS=60
 - Require CI success (`lint`, `test`, `build`) before merge.
 - Use squash merge and conventional commit-style PR titles/messages.
 
-## Frontend Placeholder
+## Frontend
 
 The frontend is the browser-facing client for the same backend APIs used by the CLI.
 
@@ -349,7 +349,7 @@ The frontend is the browser-facing client for the same backend APIs used by the 
 | Item | URL |
 | --- | --- |
 | Frontend Repo | https://github.com/JohnUghiovhe/insighta-web |
-| Frontend Live App | https://insighta-web-pied.vercel.app/ |
+| Frontend Live App | https://insighta-web-pied.vercel.app |
 
 ### Frontend Responsibilities
 
